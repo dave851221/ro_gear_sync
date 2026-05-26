@@ -24,7 +24,7 @@
 | **Windows 10 / 11 電腦** | 工具是 Windows 專用 |
 | **雷電模擬器 9**（LDPlayer 9） | RO 手遊跑在模擬器上 |
 | **RO 仙境傳說：世界之旅** | 安裝在雷電裡，能正常登入並進入公會 |
-| **RO_GearSync 整包資料夾** | 由上方下載連結取得（包含 `RO_GearSync.exe`、`_internal/`、`config.ini`、`README.md`） |
+| **RO_GearSync 整包** | 由上方下載連結取得，下載後解壓即可（包含 `RO_GearSync.exe`、`_internal/`、`config.ini`、`README.md`） |
 
 ### 1.2 雷電模擬器設定（最關鍵）
 
@@ -39,11 +39,13 @@
 
 ### 1.3 解壓並放置工具
 
-把 `RO_GearSync_YYYYMMDD.rar`（或資料夾）解壓到任何位置，例如：
+把 `RO_GearSync_YYYYMMDD.7z` 解壓到任何位置，例如：
 ```
 C:\Software\RO_GearSync\
 ```
 路徑請避免中文與空格，否則某些情況下 PyInstaller 打包的 exe 啟動會有問題。
+
+> 💡 **解壓 .7z**：Windows 11 23H2 以上已內建支援 .7z 解壓；舊版 Windows 請先安裝 [7-Zip](https://www.7-zip.org/) 或 [WinRAR](https://www.win-rar.com/)。
 
 ### 1.4 如果你已經有現成的 Excel 檔
 

@@ -40,7 +40,33 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 # collect_data_files grabs all of them; collect_submodules ensures the
 # backend selector (``from .onnxruntime import ...`` inside a function)
 # stays reachable to PyInstaller's static analyser.
-rapidocr_datas = collect_data_files("rapidocr", include_py_files=False)
+#
+# Slim filter: rapidocr ships 12 .onnx models covering v4/v5 × mobile/server
+# × infer/mobile/server variants — totalling ~411 MB. We only ever load the
+# v5 family (see gui/app.py: primary=v5-mobile, fallback=v5-server) plus the
+# cls model. Stripping v4 + the *_infer variants saves ~227 MB on disk.
+# Keep BOTH .txt dictionaries (~MB level, no point filtering).
+import os as _os
+
+def _slim_rapidocr_models(datas):
+    keep, dropped = [], []
+    for src, dest in datas:
+        name = _os.path.basename(src).lower()
+        # Filenames use "pp-ocrv4" with a dash (e.g. ch_PP-OCRv4_det_mobile.onnx).
+        # Also drop the *_infer variants — they duplicate the mobile models.
+        if name.endswith(".onnx") and ("pp-ocrv4" in name or "_infer" in name):
+            dropped.append(src)
+            continue
+        keep.append((src, dest))
+    if dropped:
+        print(f"[build_app.spec] Slim: dropped {len(dropped)} unused .onnx files")
+        for p in dropped:
+            print(f"  - {_os.path.basename(p)}")
+    return keep
+
+rapidocr_datas = _slim_rapidocr_models(
+    collect_data_files("rapidocr", include_py_files=False)
+)
 rapidocr_hidden = collect_submodules("rapidocr")
 
 # ---------------------------------------------------------------- opencc

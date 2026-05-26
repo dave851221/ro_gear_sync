@@ -2,7 +2,7 @@
 
 > RO 仙境傳說：世界之旅 — 透過雷電模擬器自動擷取公會成員暱稱與裝備評分，並寫入本地 Excel。
 
-📦 **下載連結**：<https://drive.google.com/drive/folders/1R50mVrQ3xpNSaq4CyI6Mnd0CvfNTFIu9?usp=sharing>
+📦 **下載連結**：<https://github.com/dave851221/ro_gear_sync/releases/latest>
 
 每週要把 100+ 位公會成員的裝評逐一抄到 Excel 太累，這支工具會自動幫你完成這件事。
 本說明書專為**公會幹部 / 成員**撰寫，分成三個區塊：

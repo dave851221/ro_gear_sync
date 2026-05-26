@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ro_gearsync"
+version = "0.1.0"
+description = "Automated guild member gear-score capture for RO mobile (Ragnarok World Journey)."
+requires-python = ">=3.11"
+readme = "README.md"
+authors = [{ name = "Dave" }]
+license = { text = "Proprietary" }
+dependencies = [
+    "opencv-python>=4.9,<5",
+    "numpy>=1.26,<3",
+    "Pillow>=10.2,<12",
+    "rapidocr>=3.1,<4",
+    "onnxruntime>=1.17,<2",
+    "rapidfuzz>=3.6,<4",
+    "openpyxl>=3.1,<4",
+    "customtkinter>=5.2,<6",
+    "loguru>=0.7,<1",
+]
+
+[project.scripts]
+ro-gearsync = "ro_gearsync.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"ro_gearsync" = ["py.typed"]

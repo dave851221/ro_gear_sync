@@ -1,0 +1,43 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# --- venv ---
+.venv/
+venv/
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+
+# --- Project data ---
+# Per-user workbook + capture history + backups. Never goes into git.
+data/
+logs/
+pip_install.log
+
+# --- Excel files (workbook lives in data/, but also exclude stray copies) ---
+*.xlsx
+*.xls
+*.xlsm
+
+# --- PyInstaller intermediate ---
+*.spec.bak
+# build_app.spec is the canonical PyInstaller spec — keep it tracked.
+!build_app.spec
+
+# --- OCR model cache (downloaded at first run) ---
+models/cache/
+
+# --- Claude Code memory (machine-specific) ---
+.claude/
+
+# --- OS ---
+Thumbs.db
+.DS_Store

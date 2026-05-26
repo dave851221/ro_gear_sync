@@ -1,0 +1,30 @@
+# Core runtime dependencies for RO_GearSync
+# Pin to a tested minor version range to avoid surprises in CI / user machines.
+
+# --- Vision & OCR ---
+opencv-python>=4.9,<5
+numpy>=1.26,<3
+Pillow>=10.2,<12
+# rapidocr 3.x replaces the older rapidocr-onnxruntime package and
+# supports Python 3.13. ONNX Runtime is still the default backend.
+rapidocr>=3.1,<4
+onnxruntime>=1.17,<2
+
+# --- Text matching ---
+rapidfuzz>=3.6,<4
+# OpenCC: Traditional <-> Simplified Chinese conversion. Pure Python build,
+# ~200 KB models. Used so matching is robust when OCR yields a simplified
+# variant of a Traditional name (e.g. "疯狂" vs "瘋狂").
+opencc-python-reimplemented>=0.1.7
+
+# --- Excel I/O ---
+openpyxl>=3.1,<4
+
+# --- GUI ---
+customtkinter>=5.2,<6
+
+# --- Logging ---
+loguru>=0.7,<1
+
+# --- Packaging (dev only, kept here for one-stop install) ---
+pyinstaller>=6.5,<7

@@ -20,6 +20,10 @@ opencc-python-reimplemented>=0.1.7
 # --- Excel I/O ---
 openpyxl>=3.1,<4
 
+# --- HTTP (Gemini league recognition + Google Sheets roster sync) ---
+# Was previously only a transitive dependency; both features import it.
+requests>=2.31,<3
+
 # --- GUI ---
 customtkinter>=5.2,<6
 

@@ -1,16 +1,20 @@
 """Wide-table guild-scores workbook (v2 schema).
 
-Column layout (left to right):
+Column layout (left to right; Chinese headers in Excel, snake_case field
+names on :class:`PlayerRecord`):
 
-  1. correct_nickname       — USER FILLS THIS (highlighted yellow)
-  2. latest_ocr_nickname    — what OCR said most recently
-  3. confidence             — OCR confidence (0.00 .. 1.00)
-  4. review_reason          — non-empty means "needs human attention"
-  5. 裝備評分(最高)          — max across every per-day gear column (auto)
-  6..N. Per-capture columns — one column per calendar day:
+  1. ID          (player_id)            — user-maintained member number
+  2. 遊戲ID      (correct_nickname)     — USER FILLS THIS (highlighted yellow)
+  3. 職業        (profession)           — user free-text, display only
+  4. Last_OCR_ID (latest_ocr_nickname)  — what OCR said most recently
+  5. OCR信心     (confidence)           — OCR confidence (0.00 .. 1.00)
+  6. 最高裝評    (peak_gear_score)      — high-water mark (user may back-fill)
+  7..N. Per-capture columns — one column per calendar day:
 
          YYYY-MM-DD   (max gear score seen for this player on that day)
 
+``review_reason`` lives only in memory (drives red-row painting) and is
+never written as a column; legacy workbooks that still carry it load fine.
 Multiple scans on the same day merge into the same column, keeping the
 maximum value. The workbook no longer tracks weekly contribution / weekly
 activity nor the legacy `known_aliases` column — both proved unnecessary
@@ -301,6 +305,36 @@ class PlayerRecord:
         if self.peak_gear_score is None or new_val > self.peak_gear_score:
             self.peak_gear_score = new_val
         return new_val
+
+
+def duplicate_nickname_issues(records: "Iterable[PlayerRecord]") -> list[str]:
+    """Detect duplicate 遊戲ID values (post match-normalisation).
+
+    The matcher's exact lookup is first-filled-wins, so of two rows
+    sharing a 遊戲ID only the first can ever be matched — the other is
+    silently marked 未掃到 every scan. Mirrors the league side's
+    ``roster_issues``: surface the problem at load time so the user
+    fixes the workbook instead of chasing phantom misses.
+    """
+    from ..matching.matcher import normalize_for_match
+
+    issues: list[str] = []
+    seen: dict[str, str] = {}
+    for rec in records:
+        name = rec.correct_nickname.strip()
+        if not name:
+            continue
+        norm = normalize_for_match(name)
+        if not norm:
+            continue
+        if norm in seen:
+            issues.append(
+                f"遊戲ID 重複：「{seen[norm]}」與「{name}」"
+                "（掃描只會配對到前者，後者每次都會被標成未掃到）"
+            )
+        else:
+            seen[norm] = name
+    return issues
 
 
 class GuildScoresWorkbook:

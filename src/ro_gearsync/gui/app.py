@@ -81,6 +81,23 @@ _LIVE_DELTA_W = 100
 ctk.set_appearance_mode("system")
 ctk.set_default_color_theme("blue")
 
+# --- customtkinter bug guard -------------------------------------------
+# CTkScrollableFrame binds <MouseWheel> with bind_all. When the wheel
+# turns over a Tk-internal widget that has NO Python wrapper (the classic
+# case: ttk.Combobox's popdown listbox, which our league review dialog
+# uses), tkinter can't resolve the widget name, event.widget stays a
+# STRING, and customtkinter's check_if_master_is_canvas crashes with
+# "'str' object has no attribute 'master'". Patch the handler to ignore
+# such events — the popdown scrolls itself natively anyway.
+_orig_mouse_wheel_all = ctk.CTkScrollableFrame._mouse_wheel_all
+
+def _safe_mouse_wheel_all(self, event):  # noqa: ANN001 — tkinter event
+    if isinstance(getattr(event, "widget", None), str):
+        return None
+    return _orig_mouse_wheel_all(self, event)
+
+ctk.CTkScrollableFrame._mouse_wheel_all = _safe_mouse_wheel_all
+
 
 class RoGearSyncApp(ctk.CTk):
     """The main application window."""
@@ -170,9 +187,11 @@ class RoGearSyncApp(ctk.CTk):
 
     def _build_ui(self) -> None:
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(2, weight=1)
+        # row 0 = env check (shared by both features), row 1 = feature
+        # tabs (expands), row 2 = status bar.
+        self.grid_rowconfigure(1, weight=1)
 
-        # ----- env / workbook section
+        # ----- env section (shared)
         env_frame = ctk.CTkFrame(self)
         env_frame.grid(row=0, column=0, padx=12, pady=(12, 6), sticky="ew")
         env_frame.grid_columnconfigure(1, weight=1)
@@ -243,23 +262,44 @@ class RoGearSyncApp(ctk.CTk):
         # dedicated environment label (the latter just nags before the
         # user clicks 開始掃描).
 
+        # ----- feature tabs: 裝備評分 / 聯賽評分 -------------------------
+        # Everything gear-specific (Excel row, toolbar, live table) lives
+        # inside the 裝備評分 tab; the league workflow gets its own tab.
+        self.tabs = ctk.CTkTabview(self, anchor="nw")
+        self.tabs.grid(row=1, column=0, padx=12, pady=(0, 4), sticky="nsew")
+        tab_gear = self.tabs.add("裝備評分")
+        tab_league = self.tabs.add("聯賽評分")
+        tab_gear.grid_columnconfigure(0, weight=1)
+        tab_gear.grid_rowconfigure(3, weight=1)   # results frame expands
+        tab_league.grid_columnconfigure(0, weight=1)
+        tab_league.grid_rowconfigure(0, weight=1)
+
+        # League tab content is fully self-contained in LeaguePanel.
+        from .league_panel import LeaguePanel
+        self.league_panel = LeaguePanel(tab_league, self)
+        self.league_panel.grid(row=0, column=0, sticky="nsew")
+
+        # ----- gear tab: Excel row --------------------------------------
         # Same wraplength treatment as adb_label so that long workbook
         # paths + "N 名成員 / 上次更新" metadata don't clip the 變更 Excel…
-        # button. columnspan=2 lets the label occupy the expander column.
+        # button.
+        excel_frame = ctk.CTkFrame(tab_gear)
+        excel_frame.grid(row=0, column=0, padx=0, pady=(4, 6), sticky="ew")
+        excel_frame.grid_columnconfigure(0, weight=1)
         self.excel_label = ctk.CTkLabel(
-            env_frame, text="Excel： -", anchor="w", justify="left", wraplength=560,
+            excel_frame, text="Excel： -", anchor="w", justify="left", wraplength=560,
         )
-        self.excel_label.grid(row=4, column=0, padx=(12, 8), pady=2, sticky="w", columnspan=2)
-        ctk.CTkButton(env_frame, text="變更 Excel…", width=120, command=self._choose_workbook).grid(
-            row=4, column=2, padx=(8, 12), pady=2, sticky="ne"
+        self.excel_label.grid(row=0, column=0, padx=(12, 8), pady=8, sticky="w")
+        ctk.CTkButton(excel_frame, text="變更 Excel…", width=120, command=self._choose_workbook).grid(
+            row=0, column=1, padx=(8, 12), pady=8, sticky="ne"
         )
 
-        # ----- toolbar
+        # ----- gear tab: toolbar
         # Button order per spec: 成員管理 → 🚀 開始掃描 → 中止.
         # 開始掃描 is the headline action so we paint it in a saturated
         # green (matches the GitHub "primary" look) and bold the label.
-        toolbar = ctk.CTkFrame(self)
-        toolbar.grid(row=1, column=0, padx=12, pady=6, sticky="ew")
+        toolbar = ctk.CTkFrame(tab_gear)
+        toolbar.grid(row=1, column=0, padx=0, pady=(0, 6), sticky="ew")
         toolbar.grid_columnconfigure(0, weight=1)
 
         self.rename_btn = ctk.CTkButton(
@@ -285,18 +325,17 @@ class RoGearSyncApp(ctk.CTk):
         )
         self.cancel_btn.grid(row=0, column=3, padx=4, pady=8)
 
-        # ----- progress + scan results
-        self.progress_bar = ctk.CTkProgressBar(self)
-        self.progress_bar.grid(row=2, column=0, padx=12, pady=(6, 0), sticky="ew")
+        # ----- gear tab: progress + scan results
+        self.progress_bar = ctk.CTkProgressBar(tab_gear)
+        self.progress_bar.grid(row=2, column=0, padx=0, pady=(0, 0), sticky="ew")
         self.progress_bar.set(0.0)
 
-        results_frame = ctk.CTkFrame(self)
-        results_frame.grid(row=3, column=0, padx=12, pady=(6, 6), sticky="nsew")
+        results_frame = ctk.CTkFrame(tab_gear)
+        results_frame.grid(row=3, column=0, padx=0, pady=(6, 4), sticky="nsew")
         results_frame.grid_columnconfigure(0, weight=1)
         # row 4 (scrollable area) expands; rows 0-3 (capture, scan, title,
         # header) stay their natural height so the column titles stick.
         results_frame.grid_rowconfigure(4, weight=1)
-        self.grid_rowconfigure(3, weight=1)
 
         # Two separate status lines:
         #   row 0  capture_status — producer side ("截圖: N/50")
@@ -344,26 +383,30 @@ class RoGearSyncApp(ctk.CTk):
         # Inner-frame col 0 expands so each row frame fills the full width.
         self.results_list.grid_columnconfigure(0, weight=1)
 
-        # ----- status bar
+        # ----- status bar (shared)
         self.status_bar = ctk.CTkLabel(
             self, text="", anchor="w", font=ctk.CTkFont(size=12)
         )
-        self.status_bar.grid(row=4, column=0, padx=12, pady=(0, 12), sticky="ew")
+        self.status_bar.grid(row=2, column=0, padx=12, pady=(0, 12), sticky="ew")
 
     # ============================================================== menu
 
     def _build_menu(self) -> None:
         """Attach the top menu bar.
 
-        Two rescan modes hide here (per spec: keep the main toolbar
-        focused on the live workflow):
-          * 重新讀取 members.json — fast, uses cached OCR output
-          * 重新分析截圖所有圖片       — re-runs OCR on the saved page PNGs,
-                                    useful after an OCR engine upgrade
-                                    or layout tweak.
+        Everything non-headline lives under 工具 (per the 2026-07-03 spec):
+
+          工具
+            ├─ 重新分析裝評截圖 ▸
+            │    ├─ 重新讀取 members.json…   — fast, uses cached OCR output
+            │    └─ 重新分析截圖歷史 page…    — re-runs OCR on saved page PNGs
+            └─ 重新分析聯賽截圖…              — re-analyse previous league
+                                              capture sessions per screen
         """
         menubar = Menu(self)
-        rescan_menu = Menu(menubar, tearoff=0)
+        tools_menu = Menu(menubar, tearoff=0)
+
+        rescan_menu = Menu(tools_menu, tearoff=0)
         rescan_menu.add_command(
             label="重新讀取 members.json…",
             command=self._rescan_from_members_json,
@@ -372,9 +415,101 @@ class RoGearSyncApp(ctk.CTk):
             label="重新分析截圖歷史 page…",
             command=self._rescan_reocr_pages,
         )
-        menubar.add_cascade(label="重新分析截圖", menu=rescan_menu)
+        tools_menu.add_cascade(label="重新分析裝評截圖", menu=rescan_menu)
+        tools_menu.add_command(
+            label="重新分析聯賽截圖…",
+            command=self._open_league_reanalyze_dialog,
+        )
+        tools_menu.add_separator()
+        tools_menu.add_command(
+            label="從雲端名冊同步…",
+            command=self._start_roster_sync,
+        )
+        tools_menu.add_command(
+            label="清除 Google 授權",
+            command=self._forget_google_auth,
+        )
+        menubar.add_cascade(label="工具", menu=tools_menu)
         self._rescan_menu = rescan_menu
+        self._tools_menu = tools_menu
         self.config(menu=menubar)
+
+    def _open_league_reanalyze_dialog(self) -> None:
+        """Re-analyse previously captured league pages (no recapture)."""
+        # Jump to the league tab so the per-screen progress is visible.
+        self.tabs.set("聯賽評分")
+        self.league_panel.open_reanalyze_dialog()
+
+    # ------------------------------------------------- roster sync (menu)
+
+    def _forget_google_auth(self) -> None:
+        from ..roster_sync.google_sheets import clear_token
+        clear_token()
+        messagebox.showinfo(
+            "已清除 Google 授權",
+            "下次執行「從雲端名冊同步」時會重新開啟瀏覽器授權，\n"
+            "屆時可改用其他 Google 帳號。",
+        )
+
+    def _start_roster_sync(self) -> None:
+        """工具 → 從雲端名冊同步…
+
+        Fetch + diff run on a worker thread — the first run blocks on the
+        browser consent for up to minutes, and even routine runs do two
+        HTTPS round-trips. Only the review dialog touches the Tk thread."""
+        if getattr(self, "_roster_sync_busy", False):
+            messagebox.showinfo("同步進行中", "雲端名冊同步已在進行中。")
+            return
+        self._roster_sync_busy = True
+        self._tools_menu.entryconfig("從雲端名冊同步…", state="disabled")
+
+        # Pick up a freshly pasted sheet_url without an app restart.
+        reload_config()
+
+        def _worker() -> None:
+            from ..roster_sync.diff import WorkbookLoadError, compute_plan
+            from ..roster_sync.google_sheets import (
+                SheetAccessError,
+                fetch_sheet_grid,
+            )
+            from ..roster_sync.sheet_parse import (
+                SheetParseError,
+                parse_roster_grid,
+            )
+            try:
+                grid = fetch_sheet_grid()
+                plan = compute_plan(parse_roster_grid(grid))
+            except (SheetAccessError, SheetParseError, WorkbookLoadError) as exc:
+                self.after(0, self._roster_sync_failed, str(exc))
+            except Exception as exc:  # noqa: BLE001 — surface, don't die silently
+                logger.exception("roster sync failed")
+                self.after(0, self._roster_sync_failed, f"未預期的錯誤：{exc}")
+            else:
+                self.after(0, self._roster_sync_ready, plan)
+
+        threading.Thread(target=_worker, daemon=True, name="roster-sync").start()
+
+    def _roster_sync_done(self) -> None:
+        self._roster_sync_busy = False
+        self._tools_menu.entryconfig("從雲端名冊同步…", state="normal")
+
+    def _roster_sync_failed(self, message: str) -> None:
+        self._roster_sync_done()
+        messagebox.showerror("雲端名冊同步失敗", message)
+
+    def _roster_sync_ready(self, plan) -> None:
+        self._roster_sync_done()
+        if not plan.changes:
+            body = (
+                f"試算表成員 {plan.sheet_member_count} 人，"
+                "兩份 Excel 已與試算表一致，沒有需要同步的變更。"
+            )
+            if plan.warnings:
+                body += "\n\n注意：\n" + "\n".join(f"⚠ {w}" for w in plan.warnings)
+            messagebox.showinfo("雲端名冊同步", body)
+            return
+        from .roster_sync_dialog import RosterSyncDialog
+        RosterSyncDialog(self, plan)
 
     # ============================================================== env
 
@@ -400,7 +535,22 @@ class RoGearSyncApp(ctk.CTk):
         # Drop the config cache so any edits to config.ini between scans
         # are picked up without restarting the app. Cheap (just a tiny
         # INI file) and the user expects "重新偵測" to redo everything.
-        reload_config()
+        cfg = reload_config()
+        # Parse failures silently reset EVERY setting to defaults — that
+        # must never be invisible. Warn once per breakage (the flag
+        # re-arms after the user fixes the file and re-detects).
+        if cfg.load_error:
+            if not getattr(self, "_config_error_warned", False):
+                self._config_error_warned = True
+                messagebox.showwarning(
+                    "config.ini 解析失敗",
+                    "config.ini 無法解析，所有設定已改用內建預設值：\n\n"
+                    f"{cfg.load_error}\n\n"
+                    "請修正檔案內容（常見原因：同一區段內出現重複的設定名稱），"
+                    "存檔後再按「重新偵測」。",
+                )
+        else:
+            self._config_error_warned = False
         self._detecting = True
         self.detect_btn.configure(state="disabled", text="偵測中…")
         # Immediate hints so the user knows the click registered.
@@ -621,6 +771,19 @@ class RoGearSyncApp(ctk.CTk):
         meta_line = f"{filled} 名成員 ｜ 上次更新: {last_update}"
         if suffix:
             meta_line = f"{meta_line}  {suffix}"
+        # Duplicate 遊戲ID makes exact matching first-wins-only — warn at
+        # load time (mirrors the league roster's issue surfacing).
+        from ..storage.excel import duplicate_nickname_issues
+        issues = duplicate_nickname_issues(wb.records)
+        if issues:
+            preview = "；".join(issues[:2])
+            more = f"…等共 {len(issues)} 項" if len(issues) > 2 else ""
+            self.excel_label.configure(
+                text=f"Excel： ⚠ {path}\n     {meta_line}\n"
+                     f"     請先修正：{preview}{more}",
+                text_color="#cc6600",
+            )
+            return
         self.excel_label.configure(
             text=f"Excel： ✅ {path}\n     {meta_line}",
             text_color=COLOR_NEUTRAL_FG,
@@ -698,6 +861,8 @@ class RoGearSyncApp(ctk.CTk):
         self._refresh_env_status()
 
     def _choose_workbook(self) -> None:
+        from ..utils.config import set_path_value
+
         initial = self.workbook_path.parent if self.workbook_path else user_data_dir()
         chosen = filedialog.askopenfilename(
             title="選擇 guild_scores.xlsx",
@@ -706,7 +871,20 @@ class RoGearSyncApp(ctk.CTk):
         )
         if not chosen:
             return
-        self._load_workbook(Path(chosen))
+        picked = Path(chosen)
+        self._load_workbook(picked)
+        # Persist the user's pick so next launch reopens the same workbook.
+        # Only save when load succeeded — a broken file shouldn't pin itself.
+        if self.workbook is not None:
+            try:
+                set_path_value(config_path(), "workbook_path", str(picked))
+                reload_config()
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Failed to persist workbook_path to config.ini")
+                messagebox.showwarning(
+                    "寫入設定檔失敗",
+                    f"已載入工作簿，但無法更新 config.ini：{exc}",
+                )
 
     def _open_rename_dialog(self) -> None:
         if self.workbook is None or not self.workbook.records:
@@ -1982,6 +2160,21 @@ class RoGearSyncApp(ctk.CTk):
     # ============================================================== lifecycle
 
     def on_close(self) -> None:
+        # League capture/analysis still running? Closing now silently
+        # drops any recognised-but-unwritten scans (pages stay on disk,
+        # but re-analysis costs a fresh round of Gemini calls) — make
+        # the user say yes explicitly.
+        league = getattr(self, "league_panel", None)
+        if league is not None and (
+            league.runner.capturing or league.runner.analyzing
+        ):
+            if not messagebox.askyesno(
+                "聯賽處理中",
+                "聯賽拍攝／分析仍在進行中，現在關閉會捨棄尚未產出的辨識結果。\n"
+                "（截圖已存檔，之後可用「工具 → 重新分析聯賽截圖」重跑，"
+                "但需要重新呼叫 Gemini。）\n\n確定要關閉嗎？",
+            ):
+                return
         if self.runner and self.runner.is_running():
             self.runner.cancel()
         try:

@@ -38,6 +38,13 @@ models/cache/
 # --- Claude Code memory (machine-specific) ---
 .claude/
 
+# --- Secrets (Gemini API key for OCR experiment) ---
+.gemini_key
+*.gemini_key
+
+# --- Secrets (Google OAuth client for roster sync; token cache lives in data/) ---
+.google_oauth_client.json
+
 # --- OS ---
 Thumbs.db
 .DS_Store

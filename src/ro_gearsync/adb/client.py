@@ -173,11 +173,18 @@ class AdbClient:
         """Grab a PNG screenshot of the device framebuffer."""
         data = self.exec_out("screencap -p", serial=serial, timeout=timeout or 10.0)
         if not data.startswith(b"\x89PNG"):
-            # Fall back to "shell screencap -p" with manual CRLF fix-up.
-            raw = self.shell("screencap -p", serial=serial).encode(
-                "latin1", "replace"
+            # Fall back to "shell screencap -p". The stdout MUST stay raw
+            # bytes here — ``shell()`` decodes to text, and a UTF-8
+            # decode-with-replace of binary PNG data is irreversibly
+            # lossy — so we invoke ``_run`` directly with
+            # ``capture_binary=True`` and undo the CR/LF mangling some
+            # adb builds apply to shell output.
+            result = self._run(
+                [*self._device_args(serial), "shell", "screencap -p"],
+                capture_binary=True,
+                timeout=timeout or 10.0,
             )
-            data = raw.replace(b"\r\n", b"\n")
+            data = result.stdout.replace(b"\r\n", b"\n")
             if not data.startswith(b"\x89PNG"):
                 raise AdbError("screencap output is not a valid PNG")
         return data

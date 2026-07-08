@@ -142,6 +142,21 @@ class Matcher:
         review_threshold: float = MATCH_REVIEW,
         auto_threshold: float = MATCH_AUTO_LOW,
         high_threshold: float = MATCH_AUTO_HIGH,
+        # Extra OCR strings per record index, matched exactly like
+        # ``latest_ocr_nickname``. The league roster stores several
+        # historical OCR variants per member (「A｜B｜C」) — pass them
+        # split so every variant is an exact/fuzzy key. Gear callers
+        # simply omit this.
+        ocr_aliases: dict[int, Sequence[str]] | None = None,
+        # When False, the records' raw ``latest_ocr_nickname`` value is
+        # NOT registered in the pools — only the ``ocr_aliases`` variants
+        # are. The league roster packs several ｜-separated variants into
+        # that one cell; registering the raw cell would add a junk
+        # concatenated key (「A｜B｜C」 normalises to "abc" glued together,
+        # since NFKC turns ｜ into | which the punctuation strip removes)
+        # that can only ever false-match. Gear callers keep the default —
+        # their cell holds a single value.
+        use_latest_ocr_field: bool = True,
     ) -> None:
         self.records = list(records)
         self.review_threshold = review_threshold
@@ -162,17 +177,29 @@ class Matcher:
         self._ocr_strings: list[tuple[int, str]] = []
         for i, rec in enumerate(self.records):
             self._add_to_pool(i, "correct_nickname", rec.correct_nickname)
-            self._add_to_pool(i, "latest_ocr_nickname", rec.latest_ocr_nickname)
+            if use_latest_ocr_field:
+                self._add_to_pool(i, "latest_ocr_nickname", rec.latest_ocr_nickname)
             if rec.correct_nickname:
                 cn_norm = normalize_for_match(rec.correct_nickname)
                 if cn_norm:
                     self._correct_exact.setdefault(cn_norm, i)
                     self._correct_strings.append((i, cn_norm))
-            if rec.latest_ocr_nickname:
+            if use_latest_ocr_field and rec.latest_ocr_nickname:
                 ocr_norm = normalize_for_match(rec.latest_ocr_nickname)
                 if ocr_norm:
                     self._ocr_exact.setdefault(ocr_norm, i)
                     self._ocr_strings.append((i, ocr_norm))
+        if ocr_aliases:
+            for i, aliases in ocr_aliases.items():
+                if not 0 <= i < len(self.records):
+                    continue
+                for alias in aliases:
+                    norm = normalize_for_match(alias)
+                    if not norm:
+                        continue
+                    self._ocr_exact.setdefault(norm, i)
+                    self._ocr_strings.append((i, norm))
+                    self._pool.append((i, "latest_ocr_nickname", alias, norm))
 
     def _add_to_pool(self, idx: int, field_name: str, raw: str) -> None:
         if not raw:

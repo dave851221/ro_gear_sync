@@ -60,7 +60,9 @@ class OcrResult:
 
 
 _MODEL_PRESETS: dict[str, dict[str, object]] = {
-    # Default — smallest, fast, OK accuracy. PP-OCRv4 mobile.
+    # PP-OCRv4 mobile. No longer bundled with the shipped exe (models
+    # download on first use if selected via config) — kept for
+    # config compatibility only.
     "v4-mobile": {
         "Det.ocr_version": OCRVersion.PPOCRV4, "Det.model_type": ModelType.MOBILE,
         "Rec.ocr_version": OCRVersion.PPOCRV4, "Rec.model_type": ModelType.MOBILE,
@@ -102,7 +104,11 @@ class OcrEngine:
     downside in our setup.
     """
 
-    DEFAULT_QUALITY = "v4-mobile"
+    # v5-mobile since 2026-07: the v4 models were dropped from the
+    # shipped bundle (they were unused — every real call site passes v5
+    # explicitly). Keeping v4 as the fallback default was a trap: any new
+    # call site using the default would try to download models at runtime.
+    DEFAULT_QUALITY = "v5-mobile"
 
     def __init__(
         self,

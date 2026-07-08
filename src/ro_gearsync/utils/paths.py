@@ -92,6 +92,36 @@ def default_workbook_path() -> Path:
     return user_data_dir() / "guild_scores.xlsx"
 
 
+def league_roster_path() -> Path:
+    """The league member roster (``league_scores.xlsx``) — maintained by the
+    user, fully separate from the gear workbook. Config ``[league]
+    roster_path`` wins; default is ``<data>/league_scores.xlsx``."""
+    from .config import app_config
+    cfg = app_config()
+    if cfg.league_roster_path:
+        return cfg.league_roster_path
+    return user_data_dir() / "league_scores.xlsx"
+
+
+def google_token_path() -> Path:
+    """OAuth token cache for the roster-sync Google Sheets access.
+
+    Lives in the data dir (already gitignored / per-user) so the user
+    only has to click through the browser consent once per machine."""
+    return user_data_dir() / "google_token.json"
+
+
+def league_output_dir() -> Path:
+    """Folder where per-battle league snapshot files (``league_scores_*.xlsx``)
+    are written. Config ``[league] output_dir`` wins; otherwise they sit
+    next to the roster so all league files live together."""
+    from .config import app_config
+    cfg = app_config()
+    target = cfg.league_output_dir or league_roster_path().parent
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
 # --------------------------------------------------------------------- LDPlayer
 
 # Built-in auto-detect list, used when the user hasn't set ``ldplayer_dir``

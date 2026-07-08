@@ -415,7 +415,7 @@ class ScanRunner:
 
             # Pull fallback threshold from config.ini if the user
             # configured one; otherwise CaptureSession's own default
-            # (0.92 as of 2026-05-22) applies.
+            # (0.90 as of 2026-05-22) applies.
             from ..utils.config import app_config
             cfg = app_config()
             session_kwargs: dict = dict(

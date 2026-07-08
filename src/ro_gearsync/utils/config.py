@@ -23,6 +23,7 @@ while the app is running.
 from __future__ import annotations
 
 import configparser
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -69,6 +70,54 @@ fallback_model =
 # 觸發 fallback 的信心門檻 (0.0 ~ 1.0)。值越高 → 越積極觸發 fallback →
 # 整體辨識更準但更慢。預設 0.90（2026-05-22 調整後）。
 fallback_threshold =
+
+
+[league]
+# 公會聯賽戰績擷取功能（辨識引擎為 Google Gemini，設定見下方 [gemini]）。
+# 每掃一場會另存一份獨立的 Excel 快照檔
+# （檔名 league_scores_YYYYMMDD_HHMMSS.xlsx），不會動到上面的裝評工作簿。
+# 注意：聯賽與裝評的設定完全分開 — [ocr] 只影響裝評，本區段只影響聯賽。
+
+# 聯賽 Excel 快照檔的輸出資料夾。
+# 留空 = 與聯賽名冊 (roster_path) 同目錄。
+output_dir =
+
+# 聯賽成員名冊 Excel（欄位：ID、遊戲ID、職業、Last_OCR_ID）。
+# 與裝評工作簿完全分開維護；每次掃描會讀取這份名單做比對，
+# 並回寫 Last_OCR_ID 欄（其他欄位不會動）。
+# 遊戲ID 空白的列會被視為空位、自動略過。
+# 留空 = <data 資料夾>/league_scores.xlsx
+roster_path =
+
+
+[gemini]
+# 聯賽辨識用的 Gemini 模型名稱。模型版本更新很快，可自行填寫想用的型號。
+# 留空 = gemini-3.1-flash-lite（便宜、快、免費額度即可）。
+# 名字較難辨識時可改用大一階如 gemini-3-flash-preview。
+model =
+
+# Gemini API 金鑰。留空則改讀環境變數 GEMINI_API_KEY。
+# 注意：此檔會隨工具一起發佈，填在這裡等於把金鑰分享給所有使用者，
+# 且免費額度有每分鐘/每日請求上限，多人同時掃可能會被限流。
+api_key =
+
+
+[google_sheet]
+# 「從雲端名冊同步」功能：讀取公會在 Google 試算表上維護的成員名冊
+# （編號／遊戲ID／職業 三欄），比對後把退會/新進/改名等變更套用到
+# 本機的 guild_scores.xlsx 與 league_scores.xlsx（每筆變更都要人工確認）。
+#
+# 公會名冊 Google 試算表網址（瀏覽器網址列整串貼上，含 #gid=... 最好）。
+# 此網址屬機密資訊，請勿外流給公會以外的人。
+# 程式讀取時用的是「按下授權的那位使用者」的 Google 帳號權限 ——
+# 該帳號必須看得到這份試算表，否則同步會回報無權限。
+sheet_url =
+
+# 應用程式的 OAuth 用戶端（在 Google Cloud Console 建立的「桌面應用程式」
+# 用戶端）。第一次同步會開瀏覽器請使用者按「允許」，之後就不會再跳出。
+# 留空則改讀環境變數 GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET。
+oauth_client_id =
+oauth_client_secret =
 """
 
 
@@ -84,6 +133,20 @@ class AppConfig:
     ocr_primary_model: str | None = None       # e.g. "v5-mobile" | "v5-server"
     ocr_fallback_model: str | None = None      # e.g. "v5-server" | "off"
     ocr_fallback_threshold: float | None = None
+    # League feature: separate snapshot workbook, recognised via Gemini.
+    league_output_dir: Path | None = None      # where league_scores_*.xlsx land
+    league_roster_path: Path | None = None     # league_scores.xlsx (名冊)
+    gemini_model: str | None = None            # e.g. "gemini-3.1-flash-lite"
+    gemini_api_key: str | None = None          # or via env GEMINI_API_KEY
+    # Roster sync: the guild's member list on Google Sheets.
+    gsheet_url: str | None = None              # full browser URL (may carry #gid=)
+    gsheet_oauth_client_id: str | None = None      # or env GOOGLE_OAUTH_CLIENT_ID
+    gsheet_oauth_client_secret: str | None = None  # or env GOOGLE_OAUTH_CLIENT_SECRET
+    # Non-None when config.ini existed but could not be parsed — every
+    # field above silently fell back to its default. The GUI surfaces
+    # this so the user knows their settings were ignored (a silent
+    # fallback here once disabled a user's whole config without a trace).
+    load_error: str | None = None
 
     @classmethod
     def load(cls, path: Path) -> "AppConfig":
@@ -95,11 +158,14 @@ class AppConfig:
         parser = configparser.ConfigParser()
         try:
             parser.read(path, encoding="utf-8")
-        except configparser.Error:
+        except configparser.Error as exc:
             # A corrupted config shouldn't brick the app — fall back to
-            # defaults and let the user fix the file when they get around
-            # to it.
-            return cls()
+            # defaults, but record the error so the GUI can tell the
+            # user their settings were ignored (common trigger: a
+            # hand-edited duplicate key raising DuplicateOptionError).
+            from .logging import logger
+            logger.warning("config.ini 解析失敗，全部改用內建預設：{}", exc)
+            return cls(load_error=str(exc))
 
         def _path(value: str) -> Path | None:
             value = (value or "").strip()
@@ -126,6 +192,17 @@ class AppConfig:
             ocr_primary_model=_str(parser.get("ocr", "primary_model", fallback="")),
             ocr_fallback_model=_str(parser.get("ocr", "fallback_model", fallback="")),
             ocr_fallback_threshold=_float(parser.get("ocr", "fallback_threshold", fallback="")),
+            league_output_dir=_path(parser.get("league", "output_dir", fallback="")),
+            league_roster_path=_path(parser.get("league", "roster_path", fallback="")),
+            gemini_model=_str(parser.get("gemini", "model", fallback="")),
+            gemini_api_key=_str(parser.get("gemini", "api_key", fallback="")),
+            gsheet_url=_str(parser.get("google_sheet", "sheet_url", fallback="")),
+            gsheet_oauth_client_id=_str(
+                parser.get("google_sheet", "oauth_client_id", fallback="")
+            ),
+            gsheet_oauth_client_secret=_str(
+                parser.get("google_sheet", "oauth_client_secret", fallback="")
+            ),
         )
 
     @staticmethod
@@ -153,7 +230,10 @@ def set_path_value(path: Path, key: str, value: str) -> None:
 
     in_paths_section = False
     paths_section_seen = False
-    key_pattern_prefix = f"{key} ="
+    # Tolerate hand-edited spacing ("key=", "key  =") — matching only the
+    # template's "key =" form used to append a DUPLICATE key, which then
+    # made configparser reject the whole file on the next load.
+    key_re = re.compile(rf"^{re.escape(key)}\s*=")
     replaced = False
     out_lines: list[str] = []
 
@@ -170,7 +250,7 @@ def set_path_value(path: Path, key: str, value: str) -> None:
                 paths_section_seen = True
             out_lines.append(line)
             continue
-        if in_paths_section and not replaced and stripped.startswith(key_pattern_prefix):
+        if in_paths_section and not replaced and key_re.match(stripped):
             out_lines.append(f"{key} = {value}")
             replaced = True
             continue

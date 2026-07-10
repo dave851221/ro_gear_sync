@@ -240,18 +240,27 @@ class LeagueReviewDialog(ctk.CTkToplevel):
         for pidx, (var, candidates) in self._assign_vars.items():
             assigns[pidx] = candidates.get(var.get())
 
-        # Guard: two names assigned to the SAME roster member would make
-        # the later one silently overwrite the earlier one's stats.
-        chosen = [idx for idx in assigns.values() if idx is not None]
-        if len(chosen) != len(set(chosen)):
-            dup_names = [
-                p.nickname for p in self._result.players
-                if p.record_index in {i for i in chosen if chosen.count(i) > 1}
-            ]
+        by_record = {
+            p.record_index: p for p in self._result.players
+            if p.record_index is not None
+        }
+
+        # Guard: assigning SEVERAL names to one member is legitimate when
+        # they come from different screens — OCR routinely reads the same
+        # player's name differently per view, and each view's numbers land
+        # in different columns (2026-07-09 refinement; the old guard
+        # rejected every double assignment). Only same-screen overlap
+        # would overwrite the same cells — reject exactly that.
+        dup_conflicts = _duplicate_assignment_conflicts(
+            self._result.players, assigns, by_record,
+        )
+        if dup_conflicts:
             messagebox.showerror(
                 "重複指派",
-                "有兩個以上「對不到名冊」的名字被指定給同一位成員：\n"
-                f"{'、'.join(dup_names)}\n請修正後再寫入。",
+                "以下名字被指定給同一位成員，且資料來自同一個畫面"
+                "（同畫面的數據會互相覆蓋）：\n"
+                + "\n".join(dup_conflicts)
+                + "\n請修正後再寫入。",
                 parent=self,
             )
             return
@@ -262,10 +271,6 @@ class LeagueReviewDialog(ctk.CTkToplevel):
         # assignment fills the gap (2026-07-07 refinement). We warn only
         # when the source row carries data for a view the target already
         # has, because writing would then overwrite those numbers.
-        by_record = {
-            p.record_index: p for p in self._result.players
-            if p.record_index is not None
-        }
         conflicts: list[str] = []
         for pidx, idx in assigns.items():
             if idx is None:
@@ -314,6 +319,51 @@ class LeagueReviewDialog(ctk.CTkToplevel):
         self.destroy()
         if on_closed is not None:
             on_closed(wrote_any)
+
+
+def _duplicate_assignment_conflicts(
+    players: list[MatchedPlayer],
+    assigns: dict[int, "int | None"],
+    by_record: dict[int, MatchedPlayer],
+) -> list[str]:
+    """Describe same-member double assignments that would overwrite data.
+
+    Grouping the assigned source rows per target member, a pair of
+    sources conflicts only when they both carry data for the SAME
+    (battlefield, view) — e.g. two 副戰場・輸出 rows both assigned to one
+    member. Cross-screen pairs (輸出 spelling + 輔助 spelling of the same
+    player) merge into disjoint columns and are explicitly allowed.
+    Module-level (not a dialog method) so it's unit-testable without Tk.
+    """
+    by_target: dict[int, list[MatchedPlayer]] = {}
+    for pidx, idx in assigns.items():
+        if idx is None or not 0 <= pidx < len(players):
+            continue
+        by_target.setdefault(idx, []).append(players[pidx])
+
+    out: list[str] = []
+    for idx, sources in by_target.items():
+        if len(sources) < 2:
+            continue
+        target = by_record.get(idx)
+        target_name = target.nickname if target is not None else f"ID {idx}"
+        for i in range(len(sources)):
+            for j in range(i + 1, len(sources)):
+                a, b = sources[i], sources[j]
+                overlap: list[str] = []
+                for bf in ("main", "sub"):
+                    sa = getattr(a, bf)
+                    sb = getattr(b, bf)
+                    if sa is None or sb is None:
+                        continue
+                    for view in sorted(sa.source_views & sb.source_views):
+                        overlap.append(screen_label_zh(bf, view))  # type: ignore[arg-type]
+                if overlap:
+                    out.append(
+                        f"「{a.nickname}」與「{b.nickname}」→「{target_name}」"
+                        f"（{'、'.join(overlap)}）"
+                    )
+    return out
 
 
 def apply_review_decisions(result: BattleResult, decisions: dict) -> None:

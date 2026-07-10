@@ -36,8 +36,11 @@ if TYPE_CHECKING:
 # screens per battle × weekly battles produce near-identical-but-not-equal
 # strings; keeping only one loses exact-match keys). Joined newest-first
 # with a fullwidth bar — a character that can't appear in nicknames.
+# Cap 8 (2026-07-09, was 3): a single battle can legitimately contribute
+# up to five spellings (one per screen), so 3 could evict variants that
+# were still doing exact-match work the very next week.
 OCR_SEP = "｜"
-MAX_OCR_VARIANTS = 3
+MAX_OCR_VARIANTS = 8
 
 
 def split_ocr_ids(raw: object) -> list[str]:

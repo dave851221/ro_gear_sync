@@ -26,31 +26,15 @@ from typing import TYPE_CHECKING
 
 from openpyxl import load_workbook
 
+# Multi-value Last_OCR_ID helpers moved to matching/ocr_variants.py on
+# 2026-07-10 (the gear workbook adopted the same format). Re-exported here
+# so existing importers keep working.
+from ..matching import MAX_OCR_VARIANTS, OCR_SEP, merge_ocr_variant, split_ocr_ids  # noqa: F401
 from ..storage.excel import GuildScoresWorkbook, PlayerRecord
 from ..utils.logging import logger
 
 if TYPE_CHECKING:
     from .merge import BattleResult
-
-# Last_OCR_ID stores SEVERAL historical OCR variants per member (five
-# screens per battle × weekly battles produce near-identical-but-not-equal
-# strings; keeping only one loses exact-match keys). Joined newest-first
-# with a fullwidth bar — a character that can't appear in nicknames.
-# Cap 8 (2026-07-09, was 3): a single battle can legitimately contribute
-# up to five spellings (one per screen), so 3 could evict variants that
-# were still doing exact-match work the very next week.
-OCR_SEP = "｜"
-MAX_OCR_VARIANTS = 8
-
-
-def split_ocr_ids(raw: object) -> list[str]:
-    """Split a stored Last_OCR_ID cell into its variant list.
-
-    Accepts any openpyxl cell value — a hand-typed numeric cell is
-    str()ed rather than discarded."""
-    if not raw:
-        return []
-    return [part.strip() for part in str(raw).split(OCR_SEP) if part.strip()]
 
 
 def load_roster(roster_path: Path | None = None) -> list[PlayerRecord]:
@@ -154,20 +138,6 @@ def update_roster_ocr(
     if not updates:
         return 0
 
-    def _merge_variants(existing_raw, new_name: str) -> str:
-        """Prepend ``new_name`` to the stored variant list (deduped by the
-        match normalisation, newest first, capped at MAX_OCR_VARIANTS)."""
-        from ..matching.matcher import normalize_for_match
-        new_norm = normalize_for_match(new_name)
-        variants = [new_name]
-        # split_ocr_ids str()s the cell — a hand-typed numeric cell keeps
-        # its variants instead of being silently discarded.
-        for old in split_ocr_ids(existing_raw):
-            if normalize_for_match(old) == new_norm:
-                continue
-            variants.append(old)
-        return OCR_SEP.join(variants[:MAX_OCR_VARIANTS])
-
     if backup:
         backup_dir = roster_path.parent / "backups"
         backup_dir.mkdir(parents=True, exist_ok=True)
@@ -202,7 +172,7 @@ def update_roster_ocr(
         cell_value = ws.cell(row=row[0].row, column=ocr_col).value
         # Prepend variants in reverse so the primary spelling ends up first.
         for name in reversed(updates[pid]):
-            cell_value = _merge_variants(cell_value, name)
+            cell_value = merge_ocr_variant(cell_value, name)
         ws.cell(row=row[0].row, column=ocr_col, value=cell_value)
         n += 1
 

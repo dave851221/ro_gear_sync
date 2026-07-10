@@ -143,19 +143,20 @@ class Matcher:
         auto_threshold: float = MATCH_AUTO_LOW,
         high_threshold: float = MATCH_AUTO_HIGH,
         # Extra OCR strings per record index, matched exactly like
-        # ``latest_ocr_nickname``. The league roster stores several
-        # historical OCR variants per member (「A｜B｜C」) — pass them
-        # split so every variant is an exact/fuzzy key. Gear callers
-        # simply omit this.
+        # ``latest_ocr_nickname``. Both the gear workbook and the league
+        # roster store several historical OCR variants per member
+        # (「A｜B｜C」) — pass them split so every variant is an
+        # exact/fuzzy key. Construct via ``ocr_variants.build_matcher``,
+        # which does the splitting.
         ocr_aliases: dict[int, Sequence[str]] | None = None,
         # When False, the records' raw ``latest_ocr_nickname`` value is
         # NOT registered in the pools — only the ``ocr_aliases`` variants
-        # are. The league roster packs several ｜-separated variants into
-        # that one cell; registering the raw cell would add a junk
-        # concatenated key (「A｜B｜C」 normalises to "abc" glued together,
-        # since NFKC turns ｜ into | which the punctuation strip removes)
-        # that can only ever false-match. Gear callers keep the default —
-        # their cell holds a single value.
+        # are. The Last_OCR_ID cell packs several ｜-separated variants;
+        # registering the raw cell would add a junk concatenated key
+        # (「A｜B｜C」 normalises to "abc" glued together, since NFKC turns
+        # ｜ into | which the punctuation strip removes) that can only
+        # ever false-match. ``build_matcher`` always passes False; the
+        # True default only suits single-value cells.
         use_latest_ocr_field: bool = True,
     ) -> None:
         self.records = list(records)

@@ -6,27 +6,33 @@ The new flow per spec:
     and matched fuzzily at the end. Fuzzy matches go straight into the
     workbook with REVIEW_UNMATCHED (red row) — they're applied but
     flagged for human eyes next time.
-  * Anything still unmatched after fuzzy is **never** written. Instead
-    this dialog lists them so the user can see what OCR caught that
-    doesn't belong to any known player. Each entry shows which page
-    screenshot it came from so the user can verify.
+  * Anything still unmatched after fuzzy is **never** auto-written.
+    This dialog lists them with the source-screenshot row strip so the
+    user can eyeball what OCR caught, and offers a per-row dropdown
+    (mirroring the league review dialog) to manually assign the capture
+    to a missed member — an assignment writes gear AND prepends the OCR
+    string to that member's multi-value Last_OCR_ID, so the next scan
+    exact-matches. Default is 忽略 (not written).
   * Excel rows that this scan didn't see at all are also listed here,
     each with an editable gear-score field. The user can fill it in
     manually (or leave blank to skip) — only filled values get written.
 
-Two sections, both scrollable:
+Two sections, both scrollable (❷ 模糊提案 merged into ❶ 2026-07-10 —
+fuzzy rows render their OCR metadata + row-strip thumbnail inline):
 
   ┌──────────────────────────────────────────────────────────────────┐
   │  分析截圖結果統整 — {date}                                            │
   ├──────────────────────────────────────────────────────────────────┤
-  │  Excel 有但本次沒掃到 (N)  — 您可手動填入裝評，留空略過            │
+  │  ❶ Excel 有但本次沒掃到 (N)  — 手填或勾「套用」模糊提案            │
   │  ────────────────────────────────────────────────────────────── │
-  │   阿明      上次 5/19 = 65,800     本次裝評: [____________]      │
+  │   #7  阿明   上次 5/19 = 65,800   [✓套用: 69,906]  [手填]  [改名] │
+  │       OCR: 阿明6  相似 89%  信心 0.90  📄 page_011.png            │
+  │       [———————— row-strip 縮圖 ————————]                         │
   │   ...                                                             │
   ├──────────────────────────────────────────────────────────────────┤
-  │  辨識到但無 Excel 對應 (M)  — 僅供參考，不會寫入                  │
+  │  ❷ 辨識到但無 Excel 對應 (M)  — 可下拉指認成員，或忽略            │
   │  ────────────────────────────────────────────────────────────── │
-  │   緊張爺爺      85,493      conf 0.86     page_009.png            │
+  │   緊張爺爺  85,493  conf 0.86  page_009.png   指認為: [▼ 忽略]    │
   │   ...                                                             │
   ├──────────────────────────────────────────────────────────────────┤
   │                       [取消]   [確認並儲存]                       │
@@ -34,9 +40,9 @@ Two sections, both scrollable:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from tkinter import messagebox
+from tkinter import messagebox, ttk
 from typing import Callable
 
 import customtkinter as ctk
@@ -100,6 +106,11 @@ class ReviewDecisions:
       The caller writes both the gear AND updates
       ``latest_ocr_nickname`` on the matched record. Ignored when
       ``cancelled`` is True.
+    * ``assigned_unmatched`` — ❷-section captures the user manually
+      assigned to a missed member via the dropdown. Same write
+      semantics as ``approved_fuzzy`` (gear + Last_OCR_ID prepend) —
+      reuses :class:`FuzzyApproval` with ``confidence`` carrying the
+      OCR confidence. Ignored when ``cancelled`` is True.
 
     The on_confirm callback is expected to return ``True`` (or
     ``None``) on success, ``False`` if the write failed and the
@@ -107,6 +118,7 @@ class ReviewDecisions:
     """
     manual_gear: dict[int, int]
     approved_fuzzy: list[FuzzyApproval]
+    assigned_unmatched: list[FuzzyApproval] = field(default_factory=list)
     cancelled: bool = False
 
 
@@ -130,7 +142,11 @@ class UnmatchedReviewItem:
 _M_ID_W = 50              # column-A player_id ("#42")
 _M_NAME_W = 140
 _M_LAST_W = 130
-_M_CAND_W = 220           # fuzzy candidate info ("套用: 12,345 ← OCR")
+# Fuzzy-candidate checkbox column. The checkbox text is a FIXED short
+# format ("套用: 1,234,567") — the variable-length OCR metadata lives on
+# the thumbnail sub-row instead, so this column can never push the
+# 手填/改名 columns out of alignment (the pre-2026-07-10 bug).
+_M_CAND_W = 150
 _M_INPUT_W = 110
 _M_RENAME_W = 70          # per-row 改名 button
 _U_NAME_W = 160
@@ -144,7 +160,15 @@ _U_PAGE_W = 130
 # gear-score columns legible at a glance.
 _U_THUMB_W = 760
 _U_THUMB_H = 60
+# Inline thumbnail in a ❶ fuzzy row must NOT exceed the six-column
+# total (~698px incl. padding) or the spanning image would widen the
+# columns of that row and break cross-row alignment.
+_M_THUMB_W = 690
+_M_THUMB_H = 54
 _BUTTON_W = 140
+
+# Default (no-op) choice in the ❷ assignment dropdown.
+IGNORE_LABEL = "（忽略此筆，不寫入）"
 
 
 class ReviewDialog(ctk.CTkToplevel):
@@ -163,15 +187,11 @@ class ReviewDialog(ctk.CTkToplevel):
     ) -> None:
         super().__init__(master)
         self.capture_day = capture_day
-        # ❶ still owns ALL the missed rows (interactive: 套用 / 手填 /
-        # 改名). ❷ is a read-only visual aid that surfaces the source
-        # screenshot + OCR metadata for the fuzzy-hit subset, so the
-        # user can verify the proposed gear belongs to the right person
-        # before deciding whether to tick 套用 in ❶.
+        # ❶ owns ALL the missed rows (interactive: 套用 / 手填 / 改名).
+        # Fuzzy-hit rows render their OCR metadata + row-strip thumbnail
+        # inline (the standalone ❷ 模糊提案 section was merged in here
+        # 2026-07-10), so the user verifies and decides in one place.
         self.missed = missed
-        self.fuzzy_proposals: list[MissedReviewItem] = [
-            m for m in missed if m.candidate_gear is not None
-        ]
         self.unmatched = unmatched
         self.on_confirm = on_confirm
         # The workbook + rename callback let each ❶ row offer an inline
@@ -188,6 +208,9 @@ class ReviewDialog(ctk.CTkToplevel):
         # record_index → BooleanVar for the 套用 checkbox (only fuzzy
         # candidate rows have an entry here).
         self._apply_vars: dict[int, ctk.BooleanVar] = {}
+        # Per-❷-row assignment state: unmatched-list index →
+        # (StringVar, {dropdown label: record_index}).
+        self._assign_vars: dict[int, tuple[ctk.StringVar, dict[str, int]]] = {}
         # Per-row 改名 button refs so we can update label text after rename.
         self._row_widgets: dict[int, dict] = {}
         # Holds CTkImage thumbnails alive — Tk image references are weak,
@@ -215,20 +238,21 @@ class ReviewDialog(ctk.CTkToplevel):
 
     def _build_ui(self) -> None:
         self.grid_columnconfigure(0, weight=1)
-        # Three scrollable sections — share the vertical budget so the
-        # dialog stays usable whether the user has 1 missed row or 50.
-        self.grid_rowconfigure(1, weight=1)
-        self.grid_rowconfigure(3, weight=1)
-        self.grid_rowconfigure(5, weight=1)
+        # Two scrollable sections — ❶ gets the bigger share of the
+        # vertical budget (fuzzy rows carry inline thumbnails now).
+        self.grid_rowconfigure(1, weight=3)
+        self.grid_rowconfigure(3, weight=2)
 
-        # ===== ❶ Pure missed (Excel had it, OCR saw nothing) =====
+        # ===== ❶ Missed rows (pure missed + inline fuzzy proposals) =====
+        n_fuzzy = sum(1 for m in self.missed if m.candidate_gear is not None)
         missed_header = ctk.CTkFrame(self, fg_color=("#e0e0e0", "#333333"))
         missed_header.grid(row=0, column=0, padx=12, pady=(12, 0), sticky="ew")
         ctk.CTkLabel(
             missed_header,
             text=(
-                f"❶ Excel 有但本次沒掃到 ({len(self.missed)} 位) "
-                "— 您可手動填本次裝評；留空則略過該位成員。"
+                f"❶ Excel 有但本次沒掃到 ({len(self.missed)} 位，"
+                f"其中 {n_fuzzy} 位有模糊提案) — 勾「套用」寫入提案值"
+                "（下方附截圖供核對），或手填本次裝評；留空則略過。"
             ),
             anchor="w",
             font=ctk.CTkFont(size=13, weight="bold"),
@@ -243,37 +267,15 @@ class ReviewDialog(ctk.CTkToplevel):
 
         self._populate_missed()
 
-        # ===== ❷ Fuzzy proposals (OCR saw a similar name) =====
-        fuzzy_header = ctk.CTkFrame(self, fg_color=("#e0e0e0", "#333333"))
-        fuzzy_header.grid(row=2, column=0, padx=12, pady=(12, 0), sticky="ew")
-        ctk.CTkLabel(
-            fuzzy_header,
-            text=(
-                f"❷ 模糊提案 ({len(self.fuzzy_proposals)} 位) "
-                "— OCR 辨識到的名字與工作簿不完全一致；"
-                "勾「套用」即寫入提案值，或自行手填。"
-            ),
-            anchor="w",
-            font=ctk.CTkFont(size=13, weight="bold"),
-        ).grid(row=0, column=0, padx=10, pady=8, sticky="w")
-
-        self._fuzzy_frame = ctk.CTkScrollableFrame(
-            self, fg_color=("#fafafa", "#1f1f1f"),
-            label_text=None,
-        )
-        self._fuzzy_frame.grid(row=3, column=0, padx=12, pady=0, sticky="nsew")
-        self._fuzzy_frame.grid_columnconfigure(0, weight=0)
-
-        self._populate_fuzzy_proposals()
-
-        # ===== ❸ Unmatched (OCR saw it, no Excel match) =====
+        # ===== ❷ Unmatched (OCR saw it, no Excel match) =====
         unmatched_header = ctk.CTkFrame(self, fg_color=("#e0e0e0", "#333333"))
-        unmatched_header.grid(row=4, column=0, padx=12, pady=(12, 0), sticky="ew")
+        unmatched_header.grid(row=2, column=0, padx=12, pady=(12, 0), sticky="ew")
         ctk.CTkLabel(
             unmatched_header,
             text=(
-                f"❸ 辨識到但無 Excel 對應 ({len(self.unmatched)} 位) "
-                "— 僅供參考，這些不會寫入工作簿。"
+                f"❷ 辨識到但無 Excel 對應 ({len(self.unmatched)} 位) "
+                "— 可用下拉選單指認為 ❶ 的成員（會寫入裝評），"
+                "或維持「忽略」不寫入。"
             ),
             anchor="w",
             font=ctk.CTkFont(size=13, weight="bold"),
@@ -283,14 +285,14 @@ class ReviewDialog(ctk.CTkToplevel):
             self, fg_color=("#fafafa", "#1f1f1f"),
             label_text=None,
         )
-        self._unmatched_frame.grid(row=5, column=0, padx=12, pady=(0, 8), sticky="nsew")
+        self._unmatched_frame.grid(row=3, column=0, padx=12, pady=(0, 8), sticky="nsew")
         self._unmatched_frame.grid_columnconfigure(0, weight=0)
 
         self._populate_unmatched()
 
         # ===== Buttons =====
         button_row = ctk.CTkFrame(self, fg_color="transparent")
-        button_row.grid(row=6, column=0, padx=12, pady=(4, 16))
+        button_row.grid(row=4, column=0, padx=12, pady=(4, 16))
         ctk.CTkButton(
             button_row, text="取消", width=_BUTTON_W, command=self._on_cancel,
         ).grid(row=0, column=0, padx=(0, 8))
@@ -307,25 +309,35 @@ class ReviewDialog(ctk.CTkToplevel):
             return
 
         # Header row — added ID col on left + 改名 col on right per spec.
+        # Header and every data row share _configure_missed_columns so
+        # the six columns line up regardless of per-row content.
         h = ctk.CTkFrame(self._missed_frame, fg_color="transparent")
         h.grid(row=0, column=0, padx=2, pady=(2, 4), sticky="w")
+        self._configure_missed_columns(h)
         bold = ctk.CTkFont(size=12, weight="bold")
         ctk.CTkLabel(h, text="ID", width=_M_ID_W, anchor="center", font=bold).grid(
             row=0, column=0, padx=4)
         ctk.CTkLabel(h, text="名字", width=_M_NAME_W, anchor="w", font=bold).grid(
-            row=0, column=1, padx=4)
+            row=0, column=1, padx=4, sticky="w")
         ctk.CTkLabel(h, text="上次紀錄", width=_M_LAST_W, anchor="w", font=bold).grid(
-            row=0, column=2, padx=4)
-        ctk.CTkLabel(h, text="模糊提案（套用即寫入）", width=_M_CAND_W, anchor="w", font=bold).grid(
-            row=0, column=3, padx=4)
+            row=0, column=2, padx=4, sticky="w")
+        ctk.CTkLabel(h, text="模糊提案", width=_M_CAND_W, anchor="w", font=bold).grid(
+            row=0, column=3, padx=4, sticky="w")
         ctk.CTkLabel(h, text="或手填裝評", width=_M_INPUT_W, anchor="w", font=bold).grid(
-            row=0, column=4, padx=4)
+            row=0, column=4, padx=4, sticky="w")
         ctk.CTkLabel(h, text="操作", width=_M_RENAME_W, anchor="center", font=bold).grid(
             row=0, column=5, padx=4)
 
         for r_idx, item in enumerate(self.missed, start=1):
-            row = ctk.CTkFrame(self._missed_frame, fg_color=("#ffffff", "#262626"))
-            row.grid(row=r_idx, column=0, padx=2, pady=1, sticky="w")
+            is_fuzzy = item.candidate_gear is not None
+            row = ctk.CTkFrame(
+                self._missed_frame,
+                fg_color=("#ffffff", "#262626"),
+                border_width=1 if is_fuzzy else 0,
+                border_color=("#cccccc", "#444444"),
+            )
+            row.grid(row=r_idx, column=0, padx=2, pady=(4 if is_fuzzy else 1), sticky="w")
+            self._configure_missed_columns(row)
 
             # ID column
             rec = (self.workbook.records[item.record_index]
@@ -335,7 +347,7 @@ class ReviewDialog(ctk.CTkToplevel):
             ctk.CTkLabel(
                 row, text=id_text, width=_M_ID_W, anchor="center",
                 text_color=("#666666", "#aaaaaa"),
-            ).grid(row=0, column=0, padx=4, pady=4, sticky="w")
+            ).grid(row=0, column=0, padx=4, pady=4)
 
             name_label = ctk.CTkLabel(row, text=item.name, width=_M_NAME_W, anchor="w")
             name_label.grid(row=0, column=1, padx=4, pady=4, sticky="w")
@@ -357,8 +369,11 @@ class ReviewDialog(ctk.CTkToplevel):
 
             # Fuzzy candidate column — only render the 套用 checkbox
             # for rows where the matcher found a phase-3 fuzzy hit.
+            # Checkbox text is the fixed-format proposal value only; the
+            # OCR name / similarity / confidence / thumbnail render on
+            # the sub-rows below so this column stays a constant width.
             entry = ctk.CTkEntry(row, width=_M_INPUT_W, placeholder_text="留空略過")
-            if item.candidate_gear is not None:
+            if is_fuzzy:
                 apply_var = ctk.BooleanVar(value=False)
 
                 def _on_toggle(*_args, idx=item.record_index, var=apply_var, e=entry):
@@ -370,17 +385,9 @@ class ReviewDialog(ctk.CTkToplevel):
 
                 apply_var.trace_add("write", _on_toggle)
                 self._apply_vars[item.record_index] = apply_var
-                cand_text = (
-                    f"套用: {item.candidate_gear:,}"
-                    f"   (OCR:{item.candidate_ocr_name or '?'}"
-                    f", {item.candidate_score:.0f}%)"
-                ) if item.candidate_score is not None else (
-                    f"套用: {item.candidate_gear:,}"
-                    f"   (OCR:{item.candidate_ocr_name or '?'})"
-                )
                 ctk.CTkCheckBox(
                     row,
-                    text=cand_text,
+                    text=f"套用: {item.candidate_gear:,}",
                     variable=apply_var,
                     width=_M_CAND_W,
                     text_color=("#1d6f3a", "#7cd693"),
@@ -403,98 +410,72 @@ class ReviewDialog(ctk.CTkToplevel):
                     self._open_inline_rename(i, lbl),
                 state="normal" if (self.workbook and self.on_renamed) else "disabled",
             )
-            rename_btn.grid(row=0, column=5, padx=4, pady=4, sticky="w")
+            rename_btn.grid(row=0, column=5, padx=4, pady=4)
             self._row_widgets[item.record_index] = {
                 "name_label": name_label, "rename_btn": rename_btn,
             }
 
-    def _populate_fuzzy_proposals(self) -> None:
-        """Render ❷: READ-ONLY visual aid for the fuzzy hits in ❶.
+            if is_fuzzy:
+                self._add_fuzzy_detail_rows(row, item)
 
-        For every fuzzy proposal already listed in ❶ this section
-        shows the source-screenshot row-strip plus the Excel name and
-        OCR metadata (gear, similarity %, confidence). No 套用 checkbox
-        or 手填 entry is rendered here — those interactive controls
-        stay in ❶ so the user makes their decision in one place.
-        ❷'s sole purpose is to make it visually obvious whether the
-        proposal latched on to the right player.
+    @staticmethod
+    def _configure_missed_columns(frame) -> None:
+        """Pin the six ❶-table column widths on ``frame``.
+
+        Every row is its own CTkFrame, so without a shared minsize a
+        wide widget in one row would shift its neighbours relative to
+        other rows (the pre-2026-07-10 misalignment).
         """
-        if not self.fuzzy_proposals:
-            ctk.CTkLabel(
-                self._fuzzy_frame, text="（沒有需要確認的模糊提案）",
-                text_color=("#888888", "#777777"),
-            ).grid(row=0, column=0, padx=8, pady=12, sticky="w")
-            return
+        widths = (_M_ID_W, _M_NAME_W, _M_LAST_W, _M_CAND_W, _M_INPUT_W, _M_RENAME_W)
+        for col, w in enumerate(widths):
+            frame.grid_columnconfigure(col, minsize=w + 8)  # +8 = padx*2
 
-        for r_idx, item in enumerate(self.fuzzy_proposals):
-            card = ctk.CTkFrame(
-                self._fuzzy_frame,
-                fg_color=("#ffffff", "#262626"),
-                border_width=1,
-                border_color=("#cccccc", "#444444"),
-            )
-            card.grid(row=r_idx, column=0, padx=4, pady=6, sticky="w")
+    def _add_fuzzy_detail_rows(self, row, item: MissedReviewItem) -> None:
+        """Append OCR metadata + row-strip thumbnail beneath a fuzzy row.
 
-            # ---- top: Excel name + OCR-side details (single sub-row) ----
-            meta = ctk.CTkFrame(card, fg_color="transparent")
-            meta.grid(row=0, column=0, padx=8, pady=(6, 2), sticky="w")
-
-            rec = (
-                self.workbook.records[item.record_index]
-                if self.workbook and 0 <= item.record_index < len(self.workbook.records)
-                else None
-            )
-            id_text = str(rec.player_id) if (rec and rec.player_id is not None) else "—"
+        This is the old standalone ❷ 模糊提案 card content, rendered
+        inline (2026-07-10) so the user sees proposal + evidence +
+        controls in one place.
+        """
+        meta = ctk.CTkFrame(row, fg_color="transparent")
+        meta.grid(row=1, column=1, columnspan=5, padx=4, pady=(0, 2), sticky="w")
+        ctk.CTkLabel(
+            meta, text=f"OCR: {item.candidate_ocr_name or '(空)'}", anchor="w",
+        ).grid(row=0, column=0, padx=(0, 12), sticky="w")
+        if item.candidate_score is not None:
             ctk.CTkLabel(
-                meta, text=f"#{id_text}", anchor="center",
-                text_color=("#666666", "#aaaaaa"),
-            ).grid(row=0, column=0, padx=(0, 6), sticky="w")
-            ctk.CTkLabel(
-                meta, text=item.name, anchor="w",
-                font=ctk.CTkFont(size=12, weight="bold"),
+                meta,
+                text=f"相似 {item.candidate_score:.0f}%",
+                text_color=("#1d6f3a", "#7cd693"),
             ).grid(row=0, column=1, padx=(0, 12), sticky="w")
-            ocr_name = item.candidate_ocr_name or "(空)"
+        if item.candidate_confidence is not None:
             ctk.CTkLabel(
-                meta, text=f"OCR: {ocr_name}", anchor="w",
+                meta,
+                text=f"信心 {item.candidate_confidence:.2f}",
+                text_color=("#666666", "#bbbbbb"),
             ).grid(row=0, column=2, padx=(0, 12), sticky="w")
+        if item.candidate_page is not None:
             ctk.CTkLabel(
-                meta, text=f"裝評: {item.candidate_gear:,}", anchor="w",
-            ).grid(row=0, column=3, padx=(0, 12), sticky="w")
-            if item.candidate_score is not None:
-                ctk.CTkLabel(
-                    meta,
-                    text=f"相似 {item.candidate_score:.0f}%",
-                    text_color=("#1d6f3a", "#7cd693"),
-                ).grid(row=0, column=4, padx=(0, 12), sticky="w")
-            if item.candidate_confidence is not None:
-                ctk.CTkLabel(
-                    meta,
-                    text=f"信心 {item.candidate_confidence:.2f}",
-                    text_color=("#666666", "#bbbbbb"),
-                ).grid(row=0, column=5, padx=(0, 12), sticky="w")
-            if item.candidate_page is not None:
-                ctk.CTkLabel(
-                    meta,
-                    text=f"📄 page_{item.candidate_page:03d}.png",
-                    text_color=("#666666", "#bbbbbb"),
-                ).grid(row=0, column=6, padx=(0, 0), sticky="w")
+                meta,
+                text=f"📄 page_{item.candidate_page:03d}.png",
+                text_color=("#666666", "#bbbbbb"),
+            ).grid(row=0, column=3, padx=(0, 0), sticky="w")
 
-            # ---- bottom: row-strip screenshot ---------------------------
-            thumb = self._make_row_thumbnail(
-                item.candidate_image_path, item.candidate_row_y,
+        thumb = self._make_row_thumbnail(
+            item.candidate_image_path, item.candidate_row_y,
+            size=(_M_THUMB_W, _M_THUMB_H),
+        )
+        if thumb is not None:
+            ctk.CTkLabel(row, text="", image=thumb).grid(
+                row=2, column=0, columnspan=6, padx=8, pady=(0, 6), sticky="w",
             )
-            if thumb is not None:
-                ctk.CTkLabel(card, text="", image=thumb).grid(
-                    row=1, column=0, padx=8, pady=(2, 8), sticky="w",
-                )
-            else:
-                ctk.CTkLabel(
-                    card,
-                    text="(找不到原始截圖)",
-                    width=_U_THUMB_W,
-                    anchor="w",
-                    text_color=("#888888", "#777777"),
-                ).grid(row=1, column=0, padx=8, pady=(2, 8), sticky="w")
+        else:
+            ctk.CTkLabel(
+                row,
+                text="(找不到原始截圖)",
+                anchor="w",
+                text_color=("#888888", "#777777"),
+            ).grid(row=2, column=0, columnspan=6, padx=8, pady=(0, 6), sticky="w")
 
     def _open_inline_rename(self, record_index: int, name_label) -> None:
         """Open RenameSubDialog for ❶-section per-row rename button."""
@@ -519,6 +500,29 @@ class ReviewDialog(ctk.CTkToplevel):
 
         RenameSubDialog(self, original_name=original, on_confirm=_commit)
 
+    def _assignment_candidates(self) -> dict[str, int]:
+        """Dropdown label → record_index for the ❷ assignment combobox.
+
+        Candidates are exactly the ❶ missed members (everyone the scan
+        did NOT exact-match) — an unmatched capture can only plausibly
+        belong to someone who has no data this round. ID-sorted like the
+        league dialog.
+        """
+        def _pid(item: MissedReviewItem) -> int | None:
+            rec = (self.workbook.records[item.record_index]
+                   if self.workbook and 0 <= item.record_index < len(self.workbook.records)
+                   else None)
+            return rec.player_id if rec else None
+
+        entries = sorted(
+            ((pid, m) for m in self.missed for pid in [_pid(m)]),
+            key=lambda t: (t[0] is None, t[0] if t[0] is not None else 0),
+        )
+        return {
+            f"{pid if pid is not None else '—'}｜{m.name}": m.record_index
+            for pid, m in entries
+        }
+
     def _populate_unmatched(self) -> None:
         if not self.unmatched:
             ctk.CTkLabel(
@@ -526,6 +530,8 @@ class ReviewDialog(ctk.CTkToplevel):
                 text_color=("#888888", "#777777"),
             ).grid(row=0, column=0, padx=8, pady=12, sticky="w")
             return
+
+        candidates = self._assignment_candidates()
 
         # Card layout per spec — each unmatched capture gets its own
         # bordered card with metadata on top and a large row-strip
@@ -596,11 +602,40 @@ class ReviewDialog(ctk.CTkToplevel):
             )
             page_entry.grid(row=0, column=3, padx=4, sticky="w")
 
+            # ---- middle: manual assignment dropdown ----------------------
+            # Mirrors the league review dialog (2026-07-10): the user can
+            # assign this capture to a ❶ missed member. Default 忽略 =
+            # legacy behaviour (not written). ttk.Combobox over
+            # CTkOptionMenu for the wheel-scrollable native popdown.
+            assign_row = ctk.CTkFrame(card, fg_color="transparent")
+            assign_row.grid(row=1, column=0, padx=8, pady=(0, 2), sticky="w")
+            ctk.CTkLabel(
+                assign_row, text="指認為 ❶ 的成員：", anchor="w",
+            ).grid(row=0, column=0, padx=(0, 6), sticky="w")
+            var = ctk.StringVar(value=IGNORE_LABEL)
+            combo = ttk.Combobox(
+                assign_row, textvariable=var,
+                values=[IGNORE_LABEL, *candidates],
+                state="readonly", width=32, height=18,
+            )
+            combo.grid(row=0, column=1, ipady=2)
+            # Wheel must scroll ONLY inside the opened popdown — a closed
+            # readonly combobox on Windows cycles values on wheel, which
+            # would silently change an assignment while scrolling the
+            # dialog. 'break' stops the class binding; the popdown is a
+            # separate toplevel Listbox so its own scrolling still works.
+            combo.bind("<MouseWheel>", lambda e: "break")
+            combo.bind(
+                "<<ComboboxSelected>>",
+                lambda e, u=r_idx: self._on_assignment_selected(u),
+            )
+            self._assign_vars[r_idx] = (var, candidates)
+
             # ---- bottom: row-strip screenshot ----------------------------
             thumb = self._make_row_thumbnail(item.image_path, item.row_y)
             if thumb is not None:
                 ctk.CTkLabel(card, text="", image=thumb).grid(
-                    row=1, column=0, padx=8, pady=(2, 8), sticky="w",
+                    row=2, column=0, padx=8, pady=(2, 8), sticky="w",
                 )
             else:
                 ctk.CTkLabel(
@@ -609,12 +644,13 @@ class ReviewDialog(ctk.CTkToplevel):
                     width=_U_THUMB_W,
                     anchor="w",
                     text_color=("#888888", "#777777"),
-                ).grid(row=1, column=0, padx=8, pady=(2, 8), sticky="w")
+                ).grid(row=2, column=0, padx=8, pady=(2, 8), sticky="w")
 
     def _make_row_thumbnail(
         self,
         image_path: "Path | None",
         row_y: int | None,
+        size: tuple[int, int] = (_U_THUMB_W, _U_THUMB_H),
     ) -> "ctk.CTkImage | None":
         """Crop a horizontal band around ``row_y`` and shrink for display.
 
@@ -642,12 +678,75 @@ class ReviewDialog(ctk.CTkToplevel):
             ctk_img = ctk.CTkImage(
                 light_image=band,
                 dark_image=band,
-                size=(_U_THUMB_W, _U_THUMB_H),
+                size=size,
             )
             self._thumbnail_cache.append(ctk_img)
             return ctk_img
         except Exception:
             return None
+
+    # --------------------------------------------------------------- assignment
+
+    def _assignment_conflicts(
+        self, record_index: int, *, exclude_uidx: int | None = None,
+    ) -> list[str]:
+        """Why assigning an ❷ capture to ``record_index`` clashes.
+
+        Three clash flavours, all meaning "this member is already getting
+        a gear value from somewhere else this round":
+
+          * their ❶ 套用 checkbox is ticked (fuzzy proposal approved)
+          * their ❶ manual gear entry has a value typed in
+          * another ❷ capture is already assigned to them
+        """
+        conflicts: list[str] = []
+        apply_var = self._apply_vars.get(record_index)
+        if apply_var is not None and apply_var.get():
+            conflicts.append("❶ 已勾選「套用」模糊提案")
+        entry = self._missed_entries.get(record_index)
+        if entry is not None:
+            try:
+                if entry.get().strip():
+                    conflicts.append("❶ 已手填裝評")
+            except Exception:
+                pass
+        for uidx, (var, cand_map) in self._assign_vars.items():
+            if uidx == exclude_uidx:
+                continue
+            if cand_map.get(var.get()) == record_index:
+                other = self.unmatched[uidx]
+                conflicts.append(
+                    f"❷ 的「{other.ocr_nickname or '(空)'}」已指認給此成員"
+                )
+        return conflicts
+
+    def _on_assignment_selected(self, uidx: int) -> None:
+        """Combobox change handler — warn (not block) on clashes.
+
+        The user might intend to resolve the clash next (e.g. untick
+        套用), so selection only warns; ``_on_ok`` enforces.
+        """
+        var, cand_map = self._assign_vars[uidx]
+        record_index = cand_map.get(var.get())
+        if record_index is None:
+            return
+        conflicts = self._assignment_conflicts(record_index, exclude_uidx=uidx)
+        if conflicts:
+            name = next(
+                (m.name for m in self.missed if m.record_index == record_index),
+                "(未知)",
+            )
+            messagebox.showwarning(
+                "該成員已有本次資料",
+                (
+                    f"成員「{name}」已經會在本次寫入資料：\n"
+                    + "\n".join(f"  • {c}" for c in conflicts)
+                    + "\n\n同一位成員一次掃描只能有一筆裝評。\n"
+                    "請在按「確認並儲存」前擇一保留"
+                    "（取消勾選／清空手填／把其中一邊改回忽略）。"
+                ),
+                parent=self,
+            )
 
     # --------------------------------------------------------------- actions
 
@@ -727,12 +826,54 @@ class ReviewDialog(ctk.CTkToplevel):
                 entry.configure(border_color="#cc3333")
                 return
 
+        # ❷ assignments — collect, then hard-block unresolved clashes
+        # (selection time only warned; a member must not receive two
+        # gear values in one scan, and 套用/手填/指認 are exclusive).
+        assigned_unmatched: list[FuzzyApproval] = []
+        blockers: list[str] = []
+        for uidx, (var, cand_map) in self._assign_vars.items():
+            record_index = cand_map.get(var.get())
+            if record_index is None:
+                continue  # 忽略 — not written (legacy behaviour)
+            item = self.unmatched[uidx]
+            conflicts = self._assignment_conflicts(record_index, exclude_uidx=uidx)
+            if conflicts:
+                name = next(
+                    (m.name for m in self.missed if m.record_index == record_index),
+                    "(未知)",
+                )
+                blockers.append(
+                    f"「{item.ocr_nickname or '(空)'}」→ 成員「{name}」："
+                    + "；".join(conflicts)
+                )
+                continue
+            assigned_unmatched.append(FuzzyApproval(
+                record_index=record_index,
+                gear_score=item.gear_score,
+                ocr_nickname=item.ocr_nickname or "",
+                confidence=item.confidence,
+            ))
+        if blockers:
+            messagebox.showerror(
+                "指認衝突",
+                (
+                    "以下指認的成員同時還有其他資料來源，"
+                    "同一位成員一次掃描只能寫入一筆裝評：\n\n"
+                    + "\n".join(blockers)
+                    + "\n\n請擇一保留（取消勾選「套用」／清空手填／"
+                    "把其中一個指認改回忽略）後再按確認。"
+                ),
+                parent=self,
+            )
+            return
+
         # If the caller returns False, the workbook write failed (e.g.
         # Excel was holding the file open). Keep the review dialog
         # alive so the user can fix it and click 確認並儲存 again
         # rather than losing all their manual inputs.
         result = self.on_confirm(ReviewDecisions(
             manual_gear=manual_gear, approved_fuzzy=approved_fuzzy,
+            assigned_unmatched=assigned_unmatched,
         ))
         if result is False:
             return

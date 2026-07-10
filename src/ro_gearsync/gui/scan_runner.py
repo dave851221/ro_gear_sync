@@ -44,7 +44,7 @@ from typing import Optional, Sequence
 from ..adb import AdbClient
 from ..capture import CaptureSession
 from ..capture.session import CapturedMember, CaptureResult
-from ..matching import Matcher
+from ..matching import Matcher, build_matcher, primary_ocr_id
 from ..storage import PlayerRecord
 from ..utils.logging import logger
 from ..vision import OcrEngine
@@ -126,7 +126,8 @@ def _resolve_exact(
         ocr_nickname=nickname,
         gear_score=cm.gear_score,
         confidence=cm.nickname_confidence,
-        matched_to=rec.correct_nickname or rec.latest_ocr_nickname or nickname,
+        matched_to=rec.correct_nickname
+        or primary_ocr_id(rec.latest_ocr_nickname) or nickname,
         previous_gear=prev,
         delta=delta,
         decision="exact",
@@ -177,7 +178,8 @@ def _resolve_fuzzy(
         ocr_nickname=nickname,
         gear_score=cm.gear_score,
         confidence=cm.nickname_confidence,
-        matched_to=rec.correct_nickname or rec.latest_ocr_nickname or nickname,
+        matched_to=rec.correct_nickname
+        or primary_ocr_id(rec.latest_ocr_nickname) or nickname,
         previous_gear=prev,
         delta=delta,
         decision="fuzzy_review",
@@ -229,7 +231,8 @@ def _build_missed(
         last_val = rec.gear_scores.get(last_day) if last_day else None
         item = MissedReviewItem(
             record_index=i,
-            name=rec.correct_nickname or rec.latest_ocr_nickname or "(未填)",
+            name=rec.correct_nickname
+            or primary_ocr_id(rec.latest_ocr_nickname) or "(未填)",
             last_day=last_day,
             last_value=last_val,
         )
@@ -266,7 +269,7 @@ def resolve_captures(
     rescan-from-session and re-OCR flows pass this through; tests can
     leave it as None.
     """
-    matcher = Matcher(records)
+    matcher = build_matcher(records)
     members: list[LiveMember] = []
     pending: list[CapturedMember] = []
 
@@ -330,11 +333,14 @@ class ScanRunner:
         ocr: OcrEngine,
         fallback_ocr: Optional[OcrEngine],
         records: Sequence[PlayerRecord],
-        # 50 (was 45): 45 occasionally capped in practice. 50 gives
-        # ~5 pages of headroom over the 44-page worst case. Producer
-        # races through all 50 captures in ~90s and disconnects ADB,
-        # consumer keeps OCRing in the background.
-        max_pages: int = 50,
+        # 60 (was 50; before that 45 occasionally capped in practice).
+        # Since the producer-side frozen-list detection (2026-07-10)
+        # this is a FALLBACK ceiling only — normal scans self-stop at
+        # ~page 30-46 when the list hits bottom, so raising it costs
+        # nothing per run and buys headroom for the rare session where
+        # 50 wasn't enough (e.g. 20260523_151132 still found new
+        # members on its final page).
+        max_pages: int = 60,
         capture_day: str | None = None,
     ) -> None:
         self.adb = adb
@@ -371,9 +377,14 @@ class ScanRunner:
         Setting the session's stop_event here (rather than waiting for
         the next per-page progress callback to relay self._cancelled)
         cuts the cancel latency from ~2-4s to <1s. Producer notices on
-        its next ``_stop_event.wait()`` and bails out of the swipe loop,
-        the consumer drops the queue and exits. ADB disconnect then
-        happens via this thread's ``finally`` block in ``_run``.
+        its next stop check, bails out of the swipe loop AND pushes a
+        _StopMarker (guaranteed on every exit path — required, or a
+        consumer blocked on queue.get() waits forever); the consumer
+        additionally checks the stop event at its loop top so it skips
+        the queued backlog instead of OCR'ing it all. _run then emits a
+        bare summary (skipping the fuzzy phase) which the GUI routes to
+        _cleanup_after_cancel, and ADB disconnect happens via _run's
+        ``finally`` block.
         """
         self._cancelled = True
         sess = self._session
@@ -404,7 +415,7 @@ class ScanRunner:
     def _run(self) -> None:
         try:
             self.events.put(("status", "正在初始化擷取流程…"))
-            matcher = Matcher(self.records)
+            matcher = build_matcher(self.records)
             seen_keys: set[str] = set()
             # CapturedMember objects awaiting fuzzy phase, keyed by
             # dedup_key so the UI can update the right placeholder row.
@@ -479,7 +490,7 @@ class ScanRunner:
 
             def _capture_progress(captured: int, total: int) -> None:
                 # Producer thread — push a UI event for the camera
-                # progress line ("截圖: N/45"). UI thread handles the
+                # progress line ("截圖: N/M"). UI thread handles the
                 # actual repaint via the standard event queue.
                 self.events.put(("capture_progress", captured, total))
 
@@ -488,6 +499,18 @@ class ScanRunner:
                 progress=_progress, capture_progress=_capture_progress,
             )
             self._result = result
+
+            # User cancelled (or the first-page sanity check bailed) —
+            # skip the fuzzy/missed phases and emit a bare summary right
+            # away. _handle_summary routes was_cancelled summaries to
+            # _cleanup_after_cancel (purge session folder, reset UI), so
+            # nothing below would be shown anyway.
+            if self._cancelled:
+                self.events.put(("summary", SummaryPayload(
+                    capture_day=self.capture_day,
+                    result=result,
+                )))
+                return
 
             # Snapshot which records phase A latched onto, so phase B
             # fuzzy hits surface as candidates (NOT pure missed) below.

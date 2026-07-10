@@ -26,10 +26,18 @@ venv 在專案內 `.venv/`（使用者偏好 per-project）。無 pytest——�
 - `matching/matcher.py` — 暱稱比對（兩邊共用）：NFKC＋去飾符＋casefold＋OpenCC t2s
   正規化；裝評用 exact correct → exact ocr → fuzzy(ratio/partial/token_set, 門檻65)；
   **聯賽只用 exact**（fuzzy 2026-07-07 廢除：真實戰役中兩個相似名字被交叉配對，
-  錯得比不配還糟；非精確命中一律進人工指認，指認後回寫 Last_OCR_ID 下週即精確命中）；
-  `ocr_aliases` 參數供聯賽多值 Last_OCR_ID 使用；聯賽另傳 `use_latest_ocr_field=False`
-  （變體已拆好經 aliases 傳入，原始「A｜B｜C」整串不入池——正規化後會黏成垃圾 key）
-- `capture/session.py` — 裝評 producer/consumer 擷取管線
+  錯得比不配還糟；非精確命中一律進人工指認，指認後回寫 Last_OCR_ID 下週即精確命中）
+- `matching/ocr_variants.py` — 多值 Last_OCR_ID 共用工具（2026-07-10 自
+  league/roster.py 抽出，裝評與聯賽自此同格式）：OCR_SEP=｜、上限 8、
+  split/merge/primary helpers；**Matcher 一律經 `build_matcher()` 建**——它把
+  變體拆好餵 `ocr_aliases` 並鎖 `use_latest_ocr_field=False`（原始「A｜B｜C」
+  整串不入池——正規化後會黏成垃圾 key）；建構點共五處（excel.merge_capture、
+  scan_runner ×2、app._reocr_worker、league/merge），別再直接 `Matcher(records)`
+- `capture/session.py` — 裝評 producer/consumer 擷取管線。**取消不變式**
+  （2026-07-10 修死鎖）：producer 每條退出路徑都必須 put `_StopMarker`——
+  GUI 中止是第三方 set stop_event，consumer 卡在 queue.get() 只認 marker；
+  consumer loop-top 也檢查 stop_event（取消時跳過積壓頁不再 OCR）；
+  ScanRunner 取消時發空 summary 短路 fuzzy 階段 → GUI 收到後刪 session 資料夾
 - `storage/excel.py` — 裝評 wide-table 工作簿（v2 schema）
 - `league/` — 聯賽：model / recognizer(Gemini) / session(拍攝+辨識) / merge(比對+對帳)
   / roster(名冊+回寫) / storage(快照 Excel)
@@ -37,10 +45,18 @@ venv 在專案內 `.venv/`（使用者偏好 per-project）。無 pytest——�
   loopback＋PKCE **手刻**，只靠 stdlib＋requests、不引入 google-auth；token 存
   data/google_token.json) / sheet_parse(表頭列掃描＋編號限 1..150＋收滿 150 或遇
   第二張表頭/「排隊名單」即停——表單下方有編號重新從 1 起算的排隊表；重複編號
-  整筆排除並警告) / diff(join/leave/changed/prof 分類；changed 一律人工三選一：
-  換人/改名/略過) / apply(就地改 cell＋先備份，**不可走** GuildScoresWorkbook.save()
+  整筆排除並警告；「裝備評分」欄**選讀**（缺欄只警告不擋）、容忍千分位) /
+  diff(join/leave/changed/prof 分類；changed 一律人工三選一：換人/改名/略過；
+  另產 peak_updates（2026-07-10）——表單裝評 > guild_scores 最高裝評且**名字精確
+  一致**才列入，只升不降；GUI 整批一個勾選框、CLI 一次 y/n；反向（本地最高裝評 >
+  表單裝評，含表單 cell 空白）只計數進 sheet_stale_peaks——工具**不寫表單**，
+  GUI 確認視窗底部/無變更訊息框/CLI 都以紅字提醒使用者手動回填雲端) /
+  apply(就地改 cell＋先備份，**不可走** GuildScoresWorkbook.save()
   整本重建；換人與退會清 遊戲ID/職業/Last_OCR_ID＋裝評歷史欄，改名保留歷史只清
-  Last_OCR_ID；坑：openpyxl `ws.cell(value=None)` 是 no-op，清空必須 `.value = None`)。
+  Last_OCR_ID；join/replace 以表單裝評直接填最高裝評、rename 只升不降；
+  peak 寫入前有 staleness guard（該列名字變了就略過）；最高裝評就地寫入可持久——
+  excel.py 載入端本來就取 max(peak cell, 每日欄)；
+  坑：openpyxl `ws.cell(value=None)` 是 no-op，清空必須 `.value = None`)。
   CLI：`scripts\roster_sync.py`（--dry-run / --forget-auth）；GUI 入口在工具選單
 - `gui/` — customtkinter。`app.py` 主視窗（CTkTabview：裝備評分/聯賽評分 分頁，
   環境檢查與狀態列共用）；league_panel / league_runner / league_review_dialog；
@@ -49,11 +65,34 @@ venv 在專案內 `.venv/`（使用者偏好 per-project）。無 pytest——�
 ## 裝評（本地 OCR）鐵則
 
 - **只走 ADB**（screencap/input swipe），不抓宿主視窗 → 對視窗縮放免疫
+- 截圖端凍結偵測（2026-07-10 比照聯賽）：成員列表區（x 0.20–0.82 × rows y 帶）
+  灰階 64×32 縮圖，diff<2 連 2 幀＝捲到底 → 提前收機（halt=list_frozen、ADB 即斷，
+  歷史 18 場實測平均省 ~9 頁）；**先看過一次真捲動才武裝**——開場滑動可能被遊戲
+  吃掉導致連幀相同（20260523_230338 開頭連 3 幀），未武裝的凍結幀照常入列，
+  「列表完全不動」的病態情況仍由 consumer 舊 stuck/idle 邏輯兜底；
+  **不可比整張畫面**：列表外有動畫，真凍結時全畫面 diff 仍卡 ~2.1–2.3 門檻邊緣
 - OCR：v5-mobile 主掃＋v5-server 對低信心列 ROI 重讀（hybrid）；**cls 必關**
   （cls 會 180° 翻轉：`999999` 讀成 `666666` 且信心 1.00 的血淚教訓）
 - Excel merge 不可變式：列順序不動、不刪列、`遊戲ID`(correct_nickname) 永不覆寫、
-  同日取 max；fuzzy 命中一律需人工確認；未匹配者附紅列；
+  同日取 max；fuzzy 命中一律需人工確認；未匹配紅列只在 CLI/legacy
+  （append_unmatched=True）才追加，GUI 流程一律不自動寫未匹配；
   載入時跑 `duplicate_nickname_issues()`（重複遊戲ID 只有第一列配得到，GUI 警示）
+- review dialog 兩區（2026-07-10 由三區合併）：❶ 沒掃到（fuzzy 提案行內
+  附 OCR meta＋縮圖，checkbox 只顯示固定格式「套用: 數字」——變長文字
+  會推歪欄位；六欄以 `_configure_missed_columns` minsize 對齊，行內縮圖
+  _M_THUMB_W=690 不可超過六欄總寬）；❷ 未匹配可下拉指認為 ❶ 成員
+  （比照聯賽人工指認：寫當日裝評＋prepend Last_OCR_ID，走
+  `ReviewDecisions.assigned_unmatched` → `apply_review_decisions`，
+  與勾套用同語意；預設忽略＝不寫入）。同一成員一次掃描只能有一筆：
+  套用/手填/指認互斥，選擇時警告、確認時擋下
+- Last_OCR_ID **多值**（2026-07-10 比照聯賽）：exact/fuzzy 確認寫入都是 prepend
+  ＋正規化去重、最新在前、上限 8；空 nickname 不清既有變體；舊單值檔天然相容；
+  GUI 顯示 fallback 一律取最新變體（`primary_ocr_id`），整串只進 Excel cell
+- 日期欄保留上限 `MAX_DATE_COLUMNS=10`（2026-07-10）：`save()` 進場先
+  `prune_capture_days()` 刪最舊日期（按日期值排序、非欄位順序），peak 先
+  折入最高裝評再刪；save 整本重建所以剩餘欄自動左靠、不留空欄；備份在
+  prune 前先拍所以完整歷史在 backups/；趨勢圖/上次紀錄等讀取端只看得到
+  最近 10 天（週線圖約兩週）——這是保留策略的預期後果
 - 裝評 dedup key = 裝評數字（實測 100% 準）；gear=0 是真值，不是錯誤
 
 ## 聯賽（Gemini）設計
@@ -85,7 +124,10 @@ venv 在專案內 `.venv/`（使用者偏好 per-project）。無 pytest——�
 - **快照輸出**：每按一次確認寫入＝一份新檔 `league_scores_YYYYMMDD_HHMMSS.xlsx`
   （2026-07-08 檔名加秒：同一分鐘內按兩次確認曾會覆蓋前一份）
   （單一寬表「聯賽戰績」：ID/遊戲ID/職業/參與(主/副/主+副)＋主-8欄＋副-12欄；
-  紅列=待人工）。review 對話框按畫面分五組、不關窗可重複寫（每次 deep-copy）；
+  紅列=待人工）。疑慮淺紅標示（2026-07-10）：有參戰但該戰場全欄位 0（空值視同 0）
+  ＝該戰場**有值**的 cell 標淺紅（空 cell 不標，部分掃描的未掃畫面不誤標）；
+  參與 cell 標淺紅條件——只打一場看該場、兩場都打需兩場皆疑慮；有成員但參與
+  空白＝參與 cell 留空但標淺紅。review 對話框按畫面分五組、不關窗可重複寫（每次 deep-copy）；
   **關窗且至少成功寫入一次＝該場消費完畢**：panel 收到 on_closed(wrote_any=True) 會
   `runner.reset()`＋重置五張卡片，防止上一場沒重拍的畫面殘留混進下一場的輸出
   （沒寫入就關窗則 scans 保留，可再按產出結果）。

@@ -338,8 +338,8 @@ class RoGearSyncApp(ctk.CTk):
         results_frame.grid_rowconfigure(4, weight=1)
 
         # Two separate status lines:
-        #   row 0  capture_status — producer side ("截圖: N/50")
-        #   row 1  scan_status    — consumer side ("分析截圖中… 第 N/50 頁")
+        #   row 0  capture_status — producer side ("截圖: N/M")
+        #   row 1  scan_status    — consumer side ("分析截圖中… 第 N/M 頁")
         # The capture line is hidden during rescan-from-pages flows
         # (those have no producer, just OCR work on existing PNGs).
         self.capture_status_label = ctk.CTkLabel(
@@ -499,11 +499,17 @@ class RoGearSyncApp(ctk.CTk):
 
     def _roster_sync_ready(self, plan) -> None:
         self._roster_sync_done()
-        if not plan.changes:
+        if not plan.changes and not plan.peak_updates:
             body = (
                 f"試算表成員 {plan.sheet_member_count} 人，"
                 "兩份 Excel 已與試算表一致，沒有需要同步的變更。"
             )
+            if plan.sheet_stale_peaks:
+                body += (
+                    f"\n\n⚠ 有 {plan.sheet_stale_peaks} 筆成員的本地最高裝評"
+                    "高於表單上的裝備評分（或表單空白）——"
+                    "記得將掃描完的裝備評分更新至雲端名冊！"
+                )
             if plan.warnings:
                 body += "\n\n注意：\n" + "\n".join(f"⚠ {w}" for w in plan.warnings)
             messagebox.showinfo("雲端名冊同步", body)
@@ -1074,6 +1080,13 @@ class RoGearSyncApp(ctk.CTk):
                 parent=self,
             ):
                 return
+            # The askyesno above is modal but Tk keeps pumping events —
+            # the scan may have FINISHED while the dialog was open (the
+            # summary/review flow already took over). Cancelling now
+            # would only flip a stale flag and leave the status label
+            # lying, so just bail.
+            if not (self.runner and self.runner.is_running()):
+                return
             self.runner.cancel()
             self.scan_status_label.configure(text="正在中止分析截圖…")
             return
@@ -1134,7 +1147,7 @@ class RoGearSyncApp(ctk.CTk):
         elif kind == "progress":
             _page, total, _new = event[1], event[2], event[3]
             page_idx = event[1]
-            max_pages = self.runner.max_pages if self.runner else 50
+            max_pages = self.runner.max_pages if self.runner else 60
             self.progress_bar.set(min(1.0, (page_idx + 1) / max_pages))
             self.scan_status_label.configure(
                 text=(
@@ -1155,7 +1168,7 @@ class RoGearSyncApp(ctk.CTk):
             self._finish_scan_with_error(event[1])
 
     def _handle_capture_progress(self, captured: int, total: int) -> None:
-        """Producer-side progress: "截圖: N / 45".
+        """Producer-side progress: "截圖: N / M".
 
         When the producer reports it has captured all ``total`` frames,
         switch the label to a "可自由操控模擬器" success message —
@@ -1396,7 +1409,8 @@ class RoGearSyncApp(ctk.CTk):
             # 8 pages = ~40 members; below that on a 150-person guild
             # is unexpected and worth flagging before the user commits.
             if (
-                result.halt_reason in ("no_new_rows", "scroll_stuck_at_end")
+                result.halt_reason
+                in ("no_new_rows", "scroll_stuck_at_end", "list_frozen")
                 and len(result.pages) < 8
             ):
                 messagebox.showwarning(
@@ -1479,6 +1493,9 @@ class RoGearSyncApp(ctk.CTk):
             overrides where the user decided NOT to trust the proposal
           * ``approved_fuzzy`` — phase-3 candidates the user ticked 套用
             on; gear + OCR nickname both write through.
+          * ``assigned_unmatched`` — ❷-section captures manually
+            assigned to a member via the dropdown; same write path as
+            ``approved_fuzzy``.
         """
         if self.workbook is None or self._pending_capture_day is None:
             return True
@@ -1510,6 +1527,7 @@ class RoGearSyncApp(ctk.CTk):
                 capture_label,
                 manual_gear=decisions.manual_gear,
                 approved_fuzzy=decisions.approved_fuzzy,
+                assigned_unmatched=decisions.assigned_unmatched,
             )
             backup = self.workbook.save(backup=True)
         except PermissionError:
@@ -1536,7 +1554,10 @@ class RoGearSyncApp(ctk.CTk):
             f"模糊提案 {len(merge_result.fuzzy_candidates)} (已套用 {counts['fuzzy']})",
             f"手填補登 {counts['manual']}",
             f"共遺漏 {len(merge_result.missed_in_capture)}",
-            f"未配對 OCR {len(merge_result.unmatched_captured)} (未寫入)",
+            (
+                f"未配對 OCR {len(merge_result.unmatched_captured)} "
+                f"(指認 {counts['assigned']}、其餘未寫入)"
+            ),
         ]
         if backup:
             bits.append(f"備份 {backup.name}")
@@ -1878,7 +1899,7 @@ class RoGearSyncApp(ctk.CTk):
         """
         import cv2
         import numpy as np
-        from ..matching import Matcher
+        from ..matching import build_matcher
         from ..vision.layout import DEFAULT_LAYOUT
         from ..vision.parser import parse_member_page, refine_nicknames
         from .review_dialog import UnmatchedReviewItem
@@ -1891,7 +1912,7 @@ class RoGearSyncApp(ctk.CTk):
             assert self.workbook is not None
             layout = DEFAULT_LAYOUT
             records = self.workbook.records
-            matcher = Matcher(records)
+            matcher = build_matcher(records)
             members_dict: dict[str, CapturedMember] = {}
             seen_keys: set[str] = set()
             pending: dict[str, CapturedMember] = {}

@@ -65,6 +65,7 @@ class RowState:
     row_idx: int          # 1-based worksheet row
     nickname: str
     profession: str
+    peak: int | None = None       # guild only: current 最高裝評 cell value
 
 
 @dataclass
@@ -77,6 +78,7 @@ class WorkbookInfo:
     nick_col: int
     prof_col: int
     ocr_col: int | None
+    peak_col: int | None = None   # guild only: 最高裝評 column
     # guild only: columns wiped on leave/replace (OCR信心/最高裝評/每日裝評).
     score_cols: list[int] = field(default_factory=list)
     rows: dict[int, RowState] = field(default_factory=dict)
@@ -92,6 +94,9 @@ class Change:
     sheet_prof: str
     guild: RowState | None        # None = workbook has no row with this ID
     league: RowState | None
+    # Sheet-reported 裝備評分 — seeds/raises 最高裝評 when the change is
+    # applied (join fills it, replace resets it, rename raises it).
+    sheet_gear: int | None = None
     notes: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
@@ -111,12 +116,32 @@ class Change:
 
 
 @dataclass
+class PeakUpdate:
+    """Sheet 裝備評分 beats the workbook's 最高裝評 for a member whose
+    identity is NOT in question (names match exactly) — raise the peak."""
+    member_id: int
+    nickname: str
+    row_idx: int                  # guild workbook row
+    old: int | None
+    new: int
+
+    def summary(self) -> str:
+        old = f"{self.old:,}" if self.old is not None else "（空白）"
+        return f"{self.nickname}：{old} → {self.new:,}"
+
+
+@dataclass
 class SyncPlan:
     changes: list[Change]
     warnings: list[str]
     guild: WorkbookInfo
     league: WorkbookInfo
     sheet_member_count: int       # non-vacant slots on the sheet
+    peak_updates: list[PeakUpdate] = field(default_factory=list)
+    # Members whose LOCAL 最高裝評 beats the sheet's 裝備評分 (blank sheet
+    # cell counts too). The tool never writes to the sheet — this only
+    # feeds a "remember to update the cloud roster" reminder.
+    sheet_stale_peaks: int = 0
 
 
 def load_workbook_info(path: Path, label: str, kind: str) -> WorkbookInfo:
@@ -167,6 +192,7 @@ def load_workbook_info(path: Path, label: str, kind: str) -> WorkbookInfo:
             nick_col=headers[NICK_HEADER],
             prof_col=headers[PROFESSION_HEADER],
             ocr_col=headers.get(OCR_NICK_HEADER),
+            peak_col=headers.get(PEAK_HEADER) if with_scores else None,
             score_cols=score_cols,
         )
 
@@ -185,10 +211,19 @@ def load_workbook_info(path: Path, label: str, kind: str) -> WorkbookInfo:
                 v = row[col - 1].value if len(row) >= col else None
                 return str(v).strip() if v is not None else ""
 
+            peak = None
+            if info.peak_col is not None:
+                raw_peak = _text(info.peak_col).replace(",", "")
+                try:
+                    peak = int(float(raw_peak)) if raw_peak else None
+                except ValueError:
+                    peak = None
+
             state = RowState(
                 row_idx=row_idx,
                 nickname=_text(info.nick_col),
                 profession=_text(info.prof_col),
+                peak=peak,
             )
             if mid in info.rows:
                 if mid not in info.excluded_ids:
@@ -228,12 +263,42 @@ def compute_plan(
         (set(parsed.members) | set(guild.rows) | set(league.rows)) - skip_ids
     )
     changes: list[Change] = []
+    peak_updates: list[PeakUpdate] = []
+    sheet_stale_peaks = 0
     for mid in all_ids:
         sheet: SheetMember | None = parsed.members.get(mid)
         s_name = sheet.nickname if sheet else ""
         s_prof = sheet.profession if sheet else ""
+        s_gear = sheet.gear_score if sheet else None
         g = guild.rows.get(mid)
         l = league.rows.get(mid)
+
+        # Sheet 裝評 vs 最高裝評 — high-water mark, raise only. Restricted
+        # to rows whose identity is beyond doubt (names match exactly);
+        # join/replace/rename rows get their peak via the change itself.
+        if (
+            s_gear
+            and s_name
+            and g is not None
+            and guild.peak_col is not None
+            and g.nickname == s_name
+            and s_gear > (g.peak or 0)
+        ):
+            peak_updates.append(
+                PeakUpdate(mid, s_name, g.row_idx, g.peak, s_gear)
+            )
+
+        # Opposite direction — local peak beats the sheet (a blank sheet
+        # cell counts: the cloud is missing the number entirely). Counted
+        # only, for the "update the cloud roster" reminder.
+        if (
+            parsed.has_gear_column
+            and s_name
+            and g is not None
+            and g.nickname == s_name
+            and (g.peak or 0) > (s_gear or 0)
+        ):
+            sheet_stale_peaks += 1
 
         notes: list[str] = []
         if s_name:
@@ -282,7 +347,7 @@ def compute_plan(
         changes.append(Change(
             member_id=mid, kind=kind,
             sheet_name=s_name, sheet_prof=s_prof,
-            guild=g, league=l, notes=notes,
+            guild=g, league=l, sheet_gear=s_gear, notes=notes,
         ))
 
     return SyncPlan(
@@ -291,4 +356,6 @@ def compute_plan(
         guild=guild,
         league=league,
         sheet_member_count=sum(1 for m in parsed.members.values() if m.nickname),
+        peak_updates=peak_updates,
+        sheet_stale_peaks=sheet_stale_peaks,
     )

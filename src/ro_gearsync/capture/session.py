@@ -8,7 +8,8 @@ each), so pipelining cuts wall time by 30–40 % vs the sequential version.
       1. screencap → push image to queue
       2. issue swipe
       3. settle delay
-      → repeat until the consumer asks to stop or ``max_pages`` is hit.
+      → repeat until the member-list region freezes (list hit bottom),
+        the consumer asks to stop, or ``max_pages`` is hit.
 
   * Consumer (main thread)
       1. pop image
@@ -102,6 +103,36 @@ class _StopMarker:
 _QueueItem = Union[_PageJob, _StopMarker]
 
 
+# --- Producer-side frozen-list detection (2026-07-10) -------------------
+# Same algorithm as the league capture's left-table freeze check: crop the
+# member-list band, downsample to a 64×32 grayscale thumbnail, and treat a
+# mean absolute pixel difference below the threshold as "same frame". The
+# crop is essential — animated UI outside the list keeps the FULL-frame
+# diff at ~2.1–2.3 even when the list is truly frozen, right on top of the
+# threshold (replayed against all 18 historical sessions on 2026-07-10;
+# in-list diff drops to 0.0–0.3 at the bottom vs 6–21 while scrolling).
+#
+# "Frozen" alone does NOT mean "list hit bottom": the game occasionally
+# eats a swipe (session 20260523_230338 opened with two eaten swipes —
+# pages 0-2 identical), so the check only ARMS after the first pair of
+# frames that actually scrolled. Un-armed frozen frames are queued
+# normally so the consumer's own stuck/idle logic still covers the
+# pathological "list never scrolls at all" case.
+_LIST_X = (0.20, 0.82)          # horizontal band of the member table
+_STUCK_DIFF_THRESHOLD = 2.0     # mean abs pixel diff below this = same frame
+_FROZEN_PAGES_TO_STOP = 2       # consecutive frozen frames (while armed)
+
+
+def _list_thumb(image: np.ndarray, layout: GuildPageLayout) -> np.ndarray:
+    """Downsampled grayscale crop of the member-list band, for frame diffs."""
+    H, W = image.shape[:2]
+    x1, x2 = int(W * _LIST_X[0]), int(W * _LIST_X[1])
+    y1, y2 = layout.rows_y_pixels(H)
+    crop = image[y1:y2, x1:x2]
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    return cv2.resize(gray, (64, 32)).astype(np.int16)
+
+
 class CaptureSession:
     """Single capture run. Re-instantiate for each user-triggered scan.
 
@@ -128,14 +159,16 @@ class CaptureSession:
         swipe_duration_ms: int = 650,
         # 0.45 (was 0.55): shorter swipe distance = less inertia after
         # touch-up = no rows skipped between pages. We need a couple
-        # more pages to cover the same list (max_pages caps at 50, so
-        # plenty of headroom for a 150-member guild).
+        # more pages to cover the same list (max_pages has plenty of
+        # headroom for a 150-member guild).
         swipe_distance_ratio: float = 0.45,
-        # 55 (was 50): shorter swipe distance (0.45 vs 0.55) means we
-        # need more pages to cover the same list — roughly 150/3 = 50
-        # pages of unique content + 3 idle + 1 stuck = 54. 55 keeps
-        # comfortable headroom. Producer finishes ~100s of captures.
-        max_pages: int = 55,
+        # 60 (was 55): roughly 150/3 = 50 pages of unique content +
+        # 3 idle + 1 stuck = 54 for a full 150-member guild. Since
+        # 2026-07-10 this is a FALLBACK ceiling only: the producer
+        # normally stops earlier when the member list freezes
+        # (scrolled to bottom) — historically ~page 30-46 — so extra
+        # headroom here costs nothing on a normal run.
+        max_pages: int = 60,
         # 3 (was 2): one extra page of "saw 0 new" before we conclude
         # the list ran out. Gives a small safety buffer against rare
         # gear-score collisions that masquerade as duplicates and end
@@ -200,7 +233,7 @@ class CaptureSession:
         self._queue: Queue[_QueueItem] = Queue(maxsize=effective_queue_size)
         self._stop_event = threading.Event()
         # Set lazily by run() — producer fires it after every successful
-        # screencap so the GUI can show a "截圖: N/45" progress line.
+        # screencap so the GUI can show a "截圖: N/M" progress line.
         self._capture_progress: Callable[[int, int], None] | None = None
 
     # ----------------------------------------------------------------- API
@@ -219,7 +252,7 @@ class CaptureSession:
 
         ``capture_progress(captured_count, max_pages)`` fires from the
         PRODUCER thread once per successful screencap. Used by the GUI
-        to show a separate "截圖: N/45" line and to alert the user when
+        to show a separate "截圖: N/M" line and to alert the user when
         the camera phase is done (so they can use LDPlayer again).
         """
         self._capture_progress = capture_progress
@@ -293,32 +326,85 @@ class CaptureSession:
         """Capture frames as fast as the queue drains.
 
         Fires ``self._capture_progress(captured_count, max_pages)`` after
-        each successful screencap so the GUI can show "截圖: N/45".
-        When all ``max_pages`` are captured the producer ALSO disconnects
+        each successful screencap so the GUI can show "截圖: N/M".
+        When all ``max_pages`` are captured — or the member list freezes
+        (= we scrolled to the bottom) — the producer ALSO disconnects
         ADB right here (rather than waiting for the consumer to finish)
         — that minimises anti-cheat exposure and lets the user touch
         LDPlayer again as soon as the camera phase is done.
         """
         try:
+            last_thumb: np.ndarray | None = None
+            armed = False    # True once we've seen the list actually scroll
+            frozen_run = 0   # consecutive frozen frames while armed
             for page_idx in range(self.max_pages):
                 if self._stop_event.is_set():
                     self._queue.put(_StopMarker("stopped_by_consumer"))
                     return
                 image, image_path = self._capture_page(page_idx)
-                self._queue.put(_PageJob(page_idx, image, image_path))
+
+                # Frozen-list check (see module comment above _list_thumb).
+                thumb = _list_thumb(image, self.layout)
+                frozen = False
+                if last_thumb is not None:
+                    diff = float(np.abs(thumb - last_thumb).mean())
+                    frozen = diff < _STUCK_DIFF_THRESHOLD
+                    if not frozen:
+                        armed = True
+                        frozen_run = 0
+                last_thumb = thumb
+
+                if frozen and armed:
+                    frozen_run += 1
+                    # Identical frame — drop it (no point OCR'ing a
+                    # duplicate) and stop once we've seen enough in a row.
+                    image_path.unlink(missing_ok=True)
+                    logger.info(
+                        "page #{} member list frozen (diff={:.2f}, run={})",
+                        page_idx, diff, frozen_run,
+                    )
+                    if frozen_run >= _FROZEN_PAGES_TO_STOP:
+                        self._queue.put(_StopMarker("list_frozen"))
+                        # Flip the GUI's camera line to its done state —
+                        # captured == total is its completion signal.
+                        if self._capture_progress is not None:
+                            try:
+                                self._capture_progress(page_idx + 1, page_idx + 1)
+                            except Exception:
+                                logger.exception("capture_progress callback failed")
+                        try:
+                            self.adb.disconnect()
+                            logger.info(
+                                "producer stopped at page {} (list frozen); "
+                                "ADB disconnected", page_idx,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("producer's ADB disconnect failed: {}", exc)
+                        return
+                else:
+                    self._queue.put(_PageJob(page_idx, image, image_path))
                 if self._capture_progress is not None:
                     try:
                         self._capture_progress(page_idx + 1, self.max_pages)
                     except Exception:
                         # Never let a UI callback break the producer.
                         logger.exception("capture_progress callback failed")
-                # If consumer has flipped the stop flag while we were
-                # blocking on `put`, drop the next swipe.
+                # Stop flag flipped while we were blocking on `put` /
+                # swiping / settling. This is either the consumer's own
+                # end-of-list stop (it has already exited — the marker
+                # below is harmlessly drained by run()'s finally) or a
+                # THIRD-PARTY cancel (GUI 中止 via ScanRunner.cancel()),
+                # where the consumer is still blocked on queue.get() and
+                # NEEDS the marker to wake up — returning without one
+                # deadlocks the pipeline (pre-2026-07-10 bug: 中止 during
+                # the capture phase hung the scan thread forever).
                 if self._stop_event.is_set():
+                    self._queue.put(_StopMarker("cancelled"))
                     return
                 self._scroll_down(image.shape[:2])
                 # Settle the list animation; consumer keeps churning meanwhile.
                 if self._stop_event.wait(self._settle_delay()):
+                    self._queue.put(_StopMarker("cancelled"))
                     return
             self._queue.put(_StopMarker("max_pages"))
             # All captures done — disconnect ADB immediately so the user
@@ -354,10 +440,27 @@ class CaptureSession:
         # ONE "free" stuck page (transient hiccup), then start counting
         # subsequent stuck pages toward idle so end-of-list detection
         # still works.
+        #
+        # Since 2026-07-10 the producer drops most at-the-bottom
+        # duplicates itself (frozen-list detection), so this check now
+        # mainly sees start-of-list eaten swipes; it stays as the
+        # second net for the "list never scrolls at all" case, which
+        # the producer's ARMED freeze check deliberately ignores.
         last_thumb_hash: str | None = None
         stuck_run: int = 0  # consecutive stuck-frame count, reset on real scroll
 
         while True:
+            # Third-party cancel check (GUI 中止 → ScanRunner.cancel(),
+            # or the first-page sanity check flipping the flag from
+            # inside _merge). Without this the consumer would OCR the
+            # entire queued backlog before noticing — cancel latency in
+            # the OCR tail phase used to be "however long the remaining
+            # pages take". The consumer's own end-of-list stop never
+            # reaches here (it breaks out directly below), so this only
+            # fires for real cancellations.
+            if self._stop_event.is_set():
+                halt_reason = "cancelled"
+                break
             item = self._queue.get()
             if isinstance(item, _StopMarker):
                 if item.error is not None:

@@ -82,23 +82,35 @@ def main() -> int:
     print(f"\n試算表成員數（遊戲ID 非空白）：{plan.sheet_member_count}")
     for w in plan.warnings:
         print(f"⚠ {w}")
+    if plan.sheet_stale_peaks:
+        print(
+            f"⚠ 有 {plan.sheet_stale_peaks} 筆成員的本地最高裝評高於表單上的"
+            "裝備評分（或表單空白）——記得將掃描完的裝備評分更新至雲端名冊！"
+        )
 
-    if not plan.changes:
+    if not plan.changes and not plan.peak_updates:
         print("✓ 兩份 Excel 與試算表一致，沒有需要同步的變更。")
         return 0
 
-    print(f"\n共 {len(plan.changes)} 筆變更：")
-    for c in plan.changes:
-        print(f"  ID {c.member_id}｜{KIND_LABEL[c.kind]}｜{c.summary()}")
-        for note in c.notes:
-            print(f"      ⚠ {note}")
+    if plan.changes:
+        print(f"\n共 {len(plan.changes)} 筆變更：")
+        for c in plan.changes:
+            print(f"  ID {c.member_id}｜{KIND_LABEL[c.kind]}｜{c.summary()}")
+            for note in c.notes:
+                print(f"      ⚠ {note}")
+
+    if plan.peak_updates:
+        print(f"\n表單裝備評分高於最高裝評，共 {len(plan.peak_updates)} 筆（只升不降）：")
+        for pu in plan.peak_updates:
+            print(f"  ID {pu.member_id}｜{pu.summary()}")
 
     if args.dry_run:
         print("\n（--dry-run：未寫入）")
         return 0
 
-    print("\n逐筆確認：")
     decisions: dict[int, str] = {}
+    if plan.changes:
+        print("\n逐筆確認：")
     for c in plan.changes:
         print(f"\nID {c.member_id}｜{KIND_LABEL[c.kind]}｜{c.summary()}")
         for note in c.notes:
@@ -118,12 +130,20 @@ def main() -> int:
                 DECISION_APPLY if ans == "y" else DECISION_SKIP
             )
 
-    if all(d == DECISION_SKIP for d in decisions.values()):
+    sync_peaks = False
+    if plan.peak_updates:
+        ans = _ask(
+            f"\n更新 {len(plan.peak_updates)} 筆最高裝評（依表單裝備評分）？",
+            {"y": "更新", "n": "略過"},
+        )
+        sync_peaks = ans == "y"
+
+    if all(d == DECISION_SKIP for d in decisions.values()) and not sync_peaks:
         print("\n全部略過，未寫入。")
         return 0
 
     try:
-        report = apply_plan(plan, decisions)
+        report = apply_plan(plan, decisions, sync_peaks=sync_peaks)
     except ApplyError as exc:
         print(f"✗ {exc}")
         return 1
@@ -131,6 +151,10 @@ def main() -> int:
     print(f"\n✓ 已套用 {report.applied_count} 筆、略過 {report.skipped} 筆")
     for line in report.applied:
         print(f"  {line}")
+    if report.peak_applied:
+        print(f"  最高裝評更新 {len(report.peak_applied)} 筆：")
+        for line in report.peak_applied:
+            print(f"    {line}")
     for b in report.backups:
         print(f"  備份：{b}")
     return 0

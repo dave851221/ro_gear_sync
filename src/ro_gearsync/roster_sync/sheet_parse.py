@@ -23,6 +23,7 @@ from dataclasses import dataclass
 HEADER_ID = "編號"
 HEADER_NICK = "遊戲ID"
 HEADER_PROF = "職業"
+HEADER_GEAR = "裝備評分"
 QUEUE_BANNER = "排隊名單"
 MAX_MEMBER_ID = 150
 
@@ -36,6 +37,7 @@ class SheetMember:
     member_id: int
     nickname: str      # stripped; "" = vacant slot
     profession: str    # stripped; "" allowed
+    gear_score: int | None = None  # sheet-reported 裝備評分; None = blank/unparsable
 
 
 @dataclass
@@ -45,10 +47,26 @@ class ParsedSheet:
     # 編號 that appeared more than once — excluded from ``members`` AND
     # from the diff entirely (their absence must not read as "left").
     excluded_ids: set[int]
+    # False = the sheet has no 裝備評分 column at all; distinguishes
+    # "column missing" from "cell blank" for the peak comparisons.
+    has_gear_column: bool = False
 
 
 def _strip(cell: str) -> str:
     return (cell or "").strip()
+
+
+def _parse_gear(cell: str) -> int | None:
+    """Sheet values arrive as display strings — "77,006" with thousands
+    separators (half- or full-width). Anything non-numeric → None."""
+    text = cell.replace(",", "").replace("，", "").replace(" ", "")
+    if not text:
+        return None
+    try:
+        value = int(text)
+    except ValueError:
+        return None
+    return value if value >= 0 else None
 
 
 def _norm_header(cell: str) -> str:
@@ -79,11 +97,18 @@ def parse_roster_grid(grid: list[list[str]]) -> ParsedSheet:
     col_id = header.index(HEADER_ID)
     col_nick = header.index(HEADER_NICK)
     col_prof = header.index(HEADER_PROF)
+    # 裝備評分 is optional — older sheets may not carry it; peak-score
+    # sync is simply skipped then.
+    col_gear = header.index(HEADER_GEAR) if HEADER_GEAR in header else None
 
     members: dict[int, SheetMember] = {}
     duplicated: set[int] = set()
     warnings: list[str] = []
     seen: set[int] = set()
+    if col_gear is None:
+        warnings.append(
+            f"試算表沒有「{HEADER_GEAR}」欄 — 本次略過最高裝評比對。"
+        )
 
     for row in grid[header_idx + 1:]:
         cells = [_strip(c) for c in row]
@@ -101,6 +126,11 @@ def parse_roster_grid(grid: list[list[str]]) -> ParsedSheet:
 
         nickname = cells[col_nick] if col_nick < len(cells) else ""
         profession = cells[col_prof] if col_prof < len(cells) else ""
+        gear_score = (
+            _parse_gear(cells[col_gear])
+            if col_gear is not None and col_gear < len(cells)
+            else None
+        )
 
         if mid in seen:
             if mid not in duplicated:
@@ -112,11 +142,16 @@ def parse_roster_grid(grid: list[list[str]]) -> ParsedSheet:
             members.pop(mid, None)
         else:
             seen.add(mid)
-            members[mid] = SheetMember(mid, nickname, profession)
+            members[mid] = SheetMember(mid, nickname, profession, gear_score)
 
         if len(seen) >= MAX_MEMBER_ID:
             break  # all member slots found; rows below are other data
 
     if not members:
         raise SheetParseError("表頭之後找不到任何編號 1–150 的成員列。")
-    return ParsedSheet(members=members, warnings=warnings, excluded_ids=duplicated)
+    return ParsedSheet(
+        members=members,
+        warnings=warnings,
+        excluded_ids=duplicated,
+        has_gear_column=col_gear is not None,
+    )

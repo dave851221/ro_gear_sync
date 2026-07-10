@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from ..matching.matcher import Matcher, normalize_for_match
+from ..matching import build_matcher, normalize_for_match
 from ..storage.excel import PlayerRecord
 from .model import (
     BATTLEFIELD_LABEL,
@@ -39,7 +39,6 @@ from .model import (
     Scan,
     View,
 )
-from .roster import split_ocr_ids
 
 def screen_label_zh(battlefield: Battlefield, view: View) -> str:
     return f"{BATTLEFIELD_LABEL[battlefield]}戰場・{VIEW_LABEL[view]}"
@@ -200,16 +199,7 @@ def _match_battlefield(
 
     Returns ``(by_record_index, unmatched_stats)``.
     """
-    # Last_OCR_ID may hold several stored variants (「A｜B｜C」) — feed every
-    # variant to the matcher as an exact key, and tell it NOT to register
-    # the raw multi-value cell itself (its concatenated normalisation is a
-    # junk key that can only ever false-match).
-    aliases = {
-        i: variants
-        for i, rec in enumerate(roster)
-        if (variants := split_ocr_ids(rec.latest_ocr_nickname))
-    }
-    matcher = Matcher(roster, ocr_aliases=aliases, use_latest_ocr_field=False)
+    matcher = build_matcher(roster)
     by_record: dict[int, PlayerBattleStats] = {}
     unmatched: list[PlayerBattleStats] = []
     for stats in stats_by_key.values():

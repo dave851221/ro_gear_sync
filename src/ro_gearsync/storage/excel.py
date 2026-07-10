@@ -6,7 +6,11 @@ names on :class:`PlayerRecord`):
   1. ID          (player_id)            — user-maintained member number
   2. 遊戲ID      (correct_nickname)     — USER FILLS THIS (highlighted yellow)
   3. 職業        (profession)           — user free-text, display only
-  4. Last_OCR_ID (latest_ocr_nickname)  — what OCR said most recently
+  4. Last_OCR_ID (latest_ocr_nickname)  — OCR spellings seen so far, multi-
+                                          value 「A｜B｜C」 newest first
+                                          (matching/ocr_variants.py; single-
+                                          value legacy cells load as one
+                                          variant)
   5. OCR信心     (confidence)           — OCR confidence (0.00 .. 1.00)
   6. 最高裝評    (peak_gear_score)      — high-water mark (user may back-fill)
   7..N. Per-capture columns — one column per calendar day:
@@ -104,6 +108,12 @@ REVIEW_MISSED_THIS = "missed_this_capture"
 # verify before trusting.
 _RED_ROW_REASONS = frozenset({REVIEW_NEW, REVIEW_MISSED_THIS, REVIEW_UNMATCHED})
 
+# Retention cap for per-day date columns (2026-07-10). save() drops the
+# OLDEST date columns until at most this many remain — the all-time max
+# survives in 最高裝評 (peak_gear_score), which record_gear_for_day bumps
+# on every write and load() reconciles against the visible day columns.
+MAX_DATE_COLUMNS = 10
+
 
 _PUNCT_RE = re.compile(
     r"[\s　\.\,\;\:\!\?\-\—\–\_\(\)\[\]\{\}\<\>\@\#\$\%\^\&\*\+\=\|\\/"
@@ -176,8 +186,9 @@ class FuzzyCandidate:
     Surfaced in the post-scan review dialog's ❶ section: each candidate
     pairs a workbook row (record_index + record_name) with the captured
     OCR data that fuzzy-matched it. If the user ticks 套用, the gear
-    score lands in the day's column AND ``latest_ocr_nickname`` updates
-    to the OCR string so future scans can exact-match the same string.
+    score lands in the day's column AND the OCR string is prepended to
+    the row's multi-value ``latest_ocr_nickname`` so future scans can
+    exact-match the same string.
     """
     record_index: int
     record_name: str
@@ -448,10 +459,42 @@ class GuildScoresWorkbook:
             wb.records.append(record)
         return wb
 
+    def prune_capture_days(self, limit: int = MAX_DATE_COLUMNS) -> list[str]:
+        """Drop the oldest date columns until at most ``limit`` remain.
+
+        Called by :meth:`save` so every write path (GUI review confirm,
+        rename, bootstrap CLI --update) enforces the cap. Returns the
+        removed day labels (empty list = nothing pruned).
+
+        Pruned values are folded into ``peak_gear_score`` before removal
+        as belt-and-braces — record_gear_for_day already bumps the peak
+        on every write and load() reconciles peak against the visible
+        day columns, so this normally changes nothing, but it guarantees
+        no maximum is ever lost even for values that reached
+        ``gear_scores`` through some other path.
+        """
+        if limit < 1 or len(self.capture_days) <= limit:
+            return []
+        # "Oldest" is by date VALUE (ISO strings sort chronologically),
+        # not by column position — the user may have reordered columns.
+        removed = set(sorted(self.capture_days)[:-limit])
+        self.capture_days = [d for d in self.capture_days if d not in removed]
+        for rec in self.records:
+            for day in removed:
+                val = rec.gear_scores.pop(day, None)
+                if val is not None and (
+                    rec.peak_gear_score is None or val > rec.peak_gear_score
+                ):
+                    rec.peak_gear_score = val
+        return sorted(removed)
+
     def save(self, *, backup: bool = True, backup_dir: Path | None = None) -> Path | None:
         backup_path: Path | None = None
         if backup and self.path.is_file():
             backup_path = self._make_backup(backup_dir)
+        # Enforce the date-column retention cap on every write. The
+        # backup taken above still holds the full pre-prune history.
+        self.prune_capture_days()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # ID column is read-only — we write back whatever the user set
         # in column A (or leave blank if a phase-5 append still hasn't
@@ -477,26 +520,31 @@ class GuildScoresWorkbook:
         capture_label: str,
         manual_gear: dict[int, int | None],
         approved_fuzzy: list[FuzzyCandidate],
+        assigned_unmatched: list[FuzzyCandidate] | None = None,
     ) -> dict[str, int]:
         """Commit the user's choices from the review dialog.
 
-        Two flavours of write:
+        Three flavours of write:
 
           * ``manual_gear`` — the user typed a gear value into the
             "Excel 有但本次沒掃到" row's input box. Writes gear only;
             ``latest_ocr_nickname`` untouched (we have no OCR data for
             this row this round).
           * ``approved_fuzzy`` — the user ticked 套用 on a phase-3
-            candidate. Writes gear AND updates the row's
-            ``latest_ocr_nickname`` / ``confidence`` to the captured
-            values, so the next scan exact-matches the same OCR string.
+            candidate. Writes gear AND prepends the captured OCR string
+            to the row's multi-value ``latest_ocr_nickname`` (updating
+            ``confidence`` too), so the next scan exact-matches the same
+            OCR string.
+          * ``assigned_unmatched`` — an unmatched capture the user
+            manually assigned to a member via the ❷ dropdown
+            (2026-07-10, mirrors the league 人工指認). Identical write
+            semantics to ``approved_fuzzy``.
 
-        Returns a counts dict ``{"manual": N, "fuzzy": M}``. Adds the
-        day to ``capture_days`` if either flavour wrote anything.
+        Returns a counts dict ``{"manual": N, "fuzzy": M, "assigned": K}``.
+        Adds the day to ``capture_days`` if any flavour wrote anything.
         """
         day = _to_date_label(capture_label)
         n_manual = 0
-        n_fuzzy = 0
 
         for record_idx, gear in manual_gear.items():
             if gear is None:
@@ -509,11 +557,16 @@ class GuildScoresWorkbook:
                 rec.review_reason = ""
             n_manual += 1
 
-        for cand in approved_fuzzy:
+        from ..matching import merge_ocr_variant
+
+        def _apply_candidate(cand) -> bool:
             if not 0 <= cand.record_index < len(self.records):
-                continue
+                return False
             rec = self.records[cand.record_index]
-            rec.latest_ocr_nickname = cand.ocr_nickname
+            if cand.ocr_nickname:
+                rec.latest_ocr_nickname = merge_ocr_variant(
+                    rec.latest_ocr_nickname, cand.ocr_nickname,
+                )
             rec.confidence = cand.confidence
             rec.record_gear_for_day(day, cand.gear_score)
             # User explicitly approved this match — drop any review flag.
@@ -523,12 +576,15 @@ class GuildScoresWorkbook:
                 REVIEW_UNMATCHED, REVIEW_MISSED_THIS,
             }:
                 rec.review_reason = ""
-            n_fuzzy += 1
+            return True
 
-        if (n_manual or n_fuzzy) and day not in self.capture_days:
+        n_fuzzy = sum(_apply_candidate(c) for c in approved_fuzzy)
+        n_assigned = sum(_apply_candidate(c) for c in (assigned_unmatched or []))
+
+        if (n_manual or n_fuzzy or n_assigned) and day not in self.capture_days:
             self.capture_days.append(day)
             self.capture_days.sort()
-        return {"manual": n_manual, "fuzzy": n_fuzzy}
+        return {"manual": n_manual, "fuzzy": n_fuzzy, "assigned": n_assigned}
 
     # ----------------------------------------------------------- rename
     #
@@ -671,11 +727,11 @@ class GuildScoresWorkbook:
         must be reviewed by a human before being trusted, so the writer
         paints them red.
         """
-        from ..matching import Matcher
+        from ..matching import build_matcher, primary_ocr_id
 
         day = _to_date_label(capture_label)
         captured_list = list(captured)
-        matcher = Matcher(self.records)
+        matcher = build_matcher(self.records)
         result = MergeResult()
 
         # --- Phase 1: exact correct_nickname --------------------------------
@@ -731,7 +787,7 @@ class GuildScoresWorkbook:
             rec = self.records[cand.record_index]
             result.fuzzy_candidates.append(FuzzyCandidate(
                 record_index=cand.record_index,
-                record_name=rec.correct_nickname or rec.latest_ocr_nickname or "",
+                record_name=rec.correct_nickname or primary_ocr_id(rec.latest_ocr_nickname),
                 ocr_nickname=nickname,
                 gear_score=int(m.get("gear_score") or 0),
                 confidence=m.get("nickname_confidence"),
@@ -795,7 +851,7 @@ class GuildScoresWorkbook:
                 MergeMatch(
                     gear=rec.peak_gear_score or 0,
                     ocr_nickname=rec.correct_nickname
-                    or rec.latest_ocr_nickname,
+                    or primary_ocr_id(rec.latest_ocr_nickname),
                     matched_to="(not in this capture)",
                     match_via="missed",
                     score=None,
@@ -831,13 +887,21 @@ class GuildScoresWorkbook:
         The day's gear-score cell keeps the maximum of any existing value
         and the new capture.
         """
+        from ..matching import merge_ocr_variant
+
         rec = self.records[record_index]
         nickname = (captured.get("nickname") or "").strip()
         confidence = captured.get("nickname_confidence")
         gear = int(captured.get("gear_score") or 0)
         previous_gear = rec.previous_gear_before(day)
 
-        rec.latest_ocr_nickname = nickname
+        # Multi-value Last_OCR_ID: prepend this scan's spelling instead of
+        # overwriting, so older variants keep exact-matching next scan. An
+        # empty nickname must not wipe the stored variants.
+        if nickname:
+            rec.latest_ocr_nickname = merge_ocr_variant(
+                rec.latest_ocr_nickname, nickname,
+            )
         rec.confidence = confidence
         rec.record_gear_for_day(day, gear)
 
@@ -853,7 +917,7 @@ class GuildScoresWorkbook:
         return MergeMatch(
             gear=gear,
             ocr_nickname=nickname,
-            matched_to=rec.correct_nickname or rec.latest_ocr_nickname,
+            matched_to=rec.correct_nickname or nickname,
             match_via=match_via,
             score=match_score,
             alternatives=alternatives,

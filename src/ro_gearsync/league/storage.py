@@ -54,7 +54,7 @@ _USER_FILL = PatternFill("solid", fgColor="FFF2CC")    # 遊戲ID / 職業
 _MAIN_FILL = PatternFill("solid", fgColor="C6EFCE")    # 主 (green)
 _SUB_FILL = PatternFill("solid", fgColor="BDD7EE")     # 副 (blue)
 _BOTH_FILL = PatternFill("solid", fgColor="92D050")    # 主+副 (dark green)
-_RED_FILL = PatternFill("solid", fgColor="FFC7CE")     # review / unmatched
+_RED_FILL = PatternFill("solid", fgColor="FFC7CE")     # review / unmatched / suspect
 _MAIN_NUM_FILL = PatternFill("solid", fgColor="E2EFDA")  # 主-metric cells
 _SUB_NUM_FILL = PatternFill("solid", fgColor="DDEBF7")   # 副-metric cells
 
@@ -96,9 +96,23 @@ def _write_sheet(ws: Worksheet, result: BattleResult) -> None:
     for r_idx, p in enumerate(result.players, start=2):
         main = p.main.as_metric_dict() if p.main is not None else {}
         sub = p.sub.as_metric_dict() if p.sub is not None else {}
+        main_vals = [main.get(k) if p.main is not None else None for k in MAIN_METRICS]
+        sub_vals = [sub.get(k) if p.sub is not None else None for k in SUB_METRICS]
         values: list = [p.player_id, p.nickname, p.profession, p.participation]
-        values += [main.get(k) if p.main is not None else None for k in MAIN_METRICS]
-        values += [sub.get(k) if p.sub is not None else None for k in SUB_METRICS]
+        values += main_vals + sub_vals
+
+        # Suspicion flags (needs a human eyeball, light-red): a battlefield
+        # was played yet ALL its metric columns are 0 (blank counts as 0).
+        main_suspect = p.main is not None and all(not v for v in main_vals)
+        sub_suspect = p.sub is not None and all(not v for v in sub_vals)
+        if p.main is not None and p.sub is not None:
+            # Played both: flag 參與 only when both battlefields look wrong.
+            part_suspect = main_suspect and sub_suspect
+        elif p.main is not None or p.sub is not None:
+            part_suspect = main_suspect or sub_suspect
+        else:
+            # Member row that didn't play at all: 參與 stays blank but red.
+            part_suspect = bool(p.nickname)
 
         is_red = p.is_unmatched or p.needs_review
         for c_idx, value in enumerate(values, start=1):
@@ -115,13 +129,18 @@ def _write_sheet(ws: Worksheet, result: BattleResult) -> None:
             if header in ("遊戲ID", "職業"):
                 cell.fill = _USER_FILL
             elif header == "參與":
-                fill = _participation_fill(p.participation)
-                if fill:
-                    cell.fill = fill
+                if part_suspect:
+                    cell.fill = _RED_FILL
+                else:
+                    fill = _participation_fill(p.participation)
+                    if fill:
+                        cell.fill = fill
             elif is_metric and value is not None:
-                cell.fill = (
-                    _MAIN_NUM_FILL if c_idx <= n_meta + n_main else _SUB_NUM_FILL
-                )
+                is_main_col = c_idx <= n_meta + n_main
+                if main_suspect if is_main_col else sub_suspect:
+                    cell.fill = _RED_FILL
+                else:
+                    cell.fill = _MAIN_NUM_FILL if is_main_col else _SUB_NUM_FILL
         # Review note in the spill column on the far right.
         if p.review_note:
             note = ws.cell(row=r_idx, column=len(HEADERS) + 1, value=p.review_note)

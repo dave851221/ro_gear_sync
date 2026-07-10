@@ -17,6 +17,15 @@ needs the edit are touched; a workbook already in sync is left alone):
   rename  — same person, new name: set 遊戲ID/職業, clear Last_OCR_ID
             (old OCR variants can't match the new name), KEEP scores.
   prof    → update 職業 only.
+
+The sheet's 裝備評分 column feeds 最高裝評 (guild workbook only, 2026-07-10):
+
+  * join/replace seed the peak with the sheet value (fresh identity);
+    rename raises it only if the sheet value is bigger;
+  * ``sync_peaks=True`` additionally applies ``plan.peak_updates`` — the
+    raise-only updates for members whose names already match. The peak
+    cell survives GuildScoresWorkbook round-trips because load() keeps
+    the stored peak whenever it beats every per-day column.
 """
 from __future__ import annotations
 
@@ -53,6 +62,7 @@ class ApplyReport:
     applied: list[str] = field(default_factory=list)   # one line per change
     skipped: int = 0
     backups: list[Path] = field(default_factory=list)
+    peak_applied: list[str] = field(default_factory=list)  # one line per peak
 
     @property
     def applied_count(self) -> int:
@@ -98,6 +108,16 @@ def _apply_to_workbook(
         _set(info.nick_col, name or None)
         _set(info.prof_col, prof or None)
 
+    def _seed_peak(*, raise_only: bool) -> None:
+        """Write the sheet's 裝備評分 into 最高裝評 alongside an identity
+        fill. join/replace = fresh identity, take the sheet value as-is;
+        rename (raise_only) = same person, high-water mark semantics."""
+        if info.kind != "guild" or info.peak_col is None or not change.sheet_gear:
+            return
+        if raise_only and change.sheet_gear <= (state.peak or 0):
+            return
+        _set(info.peak_col, change.sheet_gear)
+
     if change.kind == KIND_LEAVE and decision == DECISION_APPLY:
         if not state.nickname:
             return False
@@ -117,6 +137,7 @@ def _apply_to_workbook(
             # since it was computed — leave the row alone.
             return False
         _fill(change.sheet_name, change.sheet_prof)
+        _seed_peak(raise_only=False)
         return True
 
     if change.kind == KIND_CHANGED and decision in (DECISION_REPLACE, DECISION_RENAME):
@@ -129,6 +150,7 @@ def _apply_to_workbook(
         if decision == DECISION_REPLACE:
             _clear_scores()
         _fill(change.sheet_name, change.sheet_prof)
+        _seed_peak(raise_only=decision == DECISION_RENAME)
         return True
 
     if change.kind == KIND_PROF and decision == DECISION_APPLY:
@@ -147,10 +169,17 @@ _DECISION_LABEL = {
 }
 
 
-def apply_plan(plan: SyncPlan, decisions: dict[int, str]) -> ApplyReport:
+def apply_plan(
+    plan: SyncPlan,
+    decisions: dict[int, str],
+    *,
+    sync_peaks: bool = False,
+) -> ApplyReport:
     """``decisions`` maps 編號 → apply/replace/rename/skip. Anything not
-    in the dict counts as skip. Both workbooks are opened first (fail
-    early if either is locked), backed up, edited, then saved."""
+    in the dict counts as skip. ``sync_peaks`` additionally writes
+    ``plan.peak_updates`` into the guild workbook's 最高裝評 column.
+    Both workbooks are opened first (fail early if either is locked),
+    backed up, edited, then saved."""
     report = ApplyReport()
     todo = [
         (c, decisions.get(c.member_id, DECISION_SKIP))
@@ -158,7 +187,8 @@ def apply_plan(plan: SyncPlan, decisions: dict[int, str]) -> ApplyReport:
     ]
     report.skipped = sum(1 for _, d in todo if d == DECISION_SKIP)
     todo = [(c, d) for c, d in todo if d != DECISION_SKIP]
-    if not todo:
+    peaks = plan.peak_updates if sync_peaks else []
+    if not todo and not peaks:
         return report
 
     books = []
@@ -190,6 +220,25 @@ def apply_plan(plan: SyncPlan, decisions: dict[int, str]) -> ApplyReport:
                 f"{_DECISION_LABEL.get(decision, decision)} → {where}"
             )
 
+        if peaks:
+            g_info, _g_book, g_ws = next(
+                (info, book, ws) for info, book, ws in books
+                if info.kind == "guild"
+            )
+            for pu in peaks:
+                # Staleness guard — same spirit as the join branch: if the
+                # row's name no longer matches what the plan saw, skip it.
+                cur = g_ws.cell(row=pu.row_idx, column=g_info.nick_col).value
+                cur_name = str(cur).strip() if cur is not None else ""
+                if cur_name != pu.nickname:
+                    report.peak_applied.append(
+                        f"ID {pu.member_id}｜{pu.summary()}｜"
+                        "略過（該列遊戲ID 已變動）"
+                    )
+                    continue
+                g_ws.cell(row=pu.row_idx, column=g_info.peak_col).value = pu.new
+                report.peak_applied.append(f"ID {pu.member_id}｜{pu.summary()}")
+
         # All edits staged in memory — back up, then save both.
         for info, _book, _ws in books:
             report.backups.append(_backup(info.path))
@@ -202,7 +251,8 @@ def apply_plan(plan: SyncPlan, decisions: dict[int, str]) -> ApplyReport:
                     "已寫入的備份在 backups/ 資料夾。"
                 ) from exc
         logger.info(
-            "roster sync applied: {} changes, {} skipped", len(todo), report.skipped,
+            "roster sync applied: {} changes, {} skipped, {} peak updates",
+            len(todo), report.skipped, len(report.peak_applied),
         )
         return report
     finally:

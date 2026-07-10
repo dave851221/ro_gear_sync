@@ -153,6 +153,22 @@ build_exe.ps1 打包時會自動把該 json 注入發佈包的 config.ini）。
 工作目錄的 config.ini 含真實 sheet_url，git 永久忽略其改動；日後要改「模板」
 需先 `--no-skip-worktree`、清空機密、commit、再放回機密並重設 skip-worktree。
 
+## initialize/（發佈初始化素材，2026-07-10）
+
+- `guild_scores.xlsx`／`league_scores.xlsx` — 種子名冊，打包時自動複製進發佈包
+  `data\`（**有入 git**——.gitignore 對這兩檔開了 `*.xlsx` 例外；更新種子基準
+  就直接覆蓋檔案再 commit）
+- `config.ini` — 幹部內部版設定，含真實 sheet_url／Gemini key 等機密
+  （**gitignored（明列於 .gitignore），絕不入 git**）。
+  **改 config 模板（utils/config.py `_DEFAULT_CONFIG`）時務必同步改這一份**，
+  否則內部包會缺新欄位或帶舊註解
+- `build_exe.ps1` 打包後自動處理：塞種子 Excel 進 data\ → 資料夾改名
+  `dist\RO_GearSync_v{版號}`（版號讀自 `ro_gearsync.__version__`）→ 整包複製成
+  `dist\RO_GearSync_Internal_v{版號}` 並以 initialize/config.ini 覆蓋其 config。
+  兩個資料夾檢查後直接壓 `RO_GearSync_v{版號}.7z`／
+  `RO_GearSync_Internal_v{版號}.rar`（內部版務必加密碼）即可發佈；
+  initialize/config.ini 不存在時內部包自動跳過（其他開發機仍可打公開包）
+
 ## 已知限制與技術債
 
 - **裝評工作簿 save() 是整本重建**（storage/excel.py）：使用者在 guild_scores.xlsx

@@ -45,6 +45,15 @@ models/cache/
 # --- Secrets (Google OAuth client for roster sync; token cache lives in data/) ---
 .google_oauth_client.json
 
+# --- Release initialization inputs (initialize/) ---
+# The two seed workbooks ship into the bundle's data/ at build time — they
+# ARE tracked (override the global *.xlsx rule above). The internal
+# config.ini carries REAL secrets (sheet_url, Gemini key) and must never
+# be committed — the repo is public.
+!initialize/guild_scores.xlsx
+!initialize/league_scores.xlsx
+initialize/config.ini
+
 # --- OS ---
 Thumbs.db
 .DS_Store

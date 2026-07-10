@@ -4,8 +4,10 @@
 #
 #     .\scripts\build_exe.ps1
 #
-# The resulting one-dir distribution lands in ``.\dist\RO_GearSync\``.
-# Ship that whole folder; users launch ``RO_GearSync.exe`` inside it.
+# The resulting one-dir distribution lands in ``.\dist\RO_GearSync_v{ver}\``
+# (public) plus ``.\dist\RO_GearSync_Internal_v{ver}\`` (guild-internal,
+# config.ini pre-filled from ``initialize\config.ini``). Ship the whole
+# folder; users launch ``RO_GearSync.exe`` inside it.
 #
 # Why this wrapper exists
 # -----------------------
@@ -137,8 +139,63 @@ if (Test-Path $readmeSrc) {
     Write-Host "Staged README.md → $readmeDst"
 }
 
+# ---------------------------------------------------------------------------
+# Post-package staging (2026-07-10): seed workbooks, versioned folder names,
+# and the guild-internal variant. Inputs live in <root>\initialize\:
+#   guild_scores.xlsx / league_scores.xlsx  — seed rosters copied into data/
+#                                             (tracked in git)
+#   config.ini                              — internal config with REAL
+#                                             secrets (gitignored, never
+#                                             committed). Keep it in sync
+#                                             whenever _DEFAULT_CONFIG in
+#                                             utils/config.py changes!
+# ---------------------------------------------------------------------------
+
+# Read the package version so the output folders carry it.
+$version = & $venvPython -c "import sys; sys.path.insert(0, r'$srcDir'); import ro_gearsync; print(ro_gearsync.__version__)"
+if ($LASTEXITCODE -ne 0) { throw "Failed to read package version" }
+$version = $version.Trim()
+Write-Host "Package version: $version"
+
+# Seed workbooks so a fresh install starts from the guild's current
+# rosters instead of empty files.
+$initDir = Join-Path $projectRoot "initialize"
+foreach ($wb in @("guild_scores.xlsx", "league_scores.xlsx")) {
+    $wbSrc = Join-Path $initDir $wb
+    if (Test-Path $wbSrc) {
+        Copy-Item -Path $wbSrc -Destination (Join-Path $dataDir $wb) -Force
+        Write-Host "Seeded $wb → data\"
+    } else {
+        Write-Warning "initialize\$wb not found — data\ ships without it"
+    }
+}
+
+# Rename the dist folder to RO_GearSync_v{version} — ready for the
+# maintainer to inspect and compress as RO_GearSync_v{version}.7z.
+$publicDir = Join-Path $projectRoot "dist\RO_GearSync_v$version"
+if (Test-Path $publicDir) { Remove-Item -Path $publicDir -Recurse -Force }
+Move-Item -Path $distDir -Destination $publicDir
+Write-Host "Renamed dist folder → $publicDir"
+
+# Guild-internal variant: identical bundle, but config.ini replaced with
+# the pre-filled initialize\config.ini (real sheet_url / API key). Ready
+# to compress as RO_GearSync_Internal_v{version}.rar (password-protect!).
+$internalDir = Join-Path $projectRoot "dist\RO_GearSync_Internal_v$version"
+$internalConfig = Join-Path $initDir "config.ini"
+if (Test-Path $internalConfig) {
+    if (Test-Path $internalDir) { Remove-Item -Path $internalDir -Recurse -Force }
+    Copy-Item -Path $publicDir -Destination $internalDir -Recurse
+    Copy-Item -Path $internalConfig -Destination (Join-Path $internalDir "config.ini") -Force
+    Write-Host "Staged internal variant (pre-filled config.ini) → $internalDir"
+} else {
+    Write-Warning "initialize\config.ini not found — internal variant skipped"
+}
+
 Write-Host ""
-Write-Host "Build OK — distribution in: $distDir"
-Write-Host "Launch:                      $distDir\RO_GearSync.exe"
+Write-Host "Build OK — public bundle:    $publicDir"
+if (Test-Path $internalDir) {
+    Write-Host "          internal bundle:  $internalDir"
+}
+Write-Host "Launch:                      $publicDir\RO_GearSync.exe"
 Write-Host ""
-Write-Host "Ship the entire '$distDir' folder; recipients launch RO_GearSync.exe."
+Write-Host "Compress each folder as-is: RO_GearSync_v$version.7z / RO_GearSync_Internal_v$version.rar"
